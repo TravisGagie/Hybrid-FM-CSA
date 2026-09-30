@@ -1,7 +1,7 @@
 CXX ?= g++
 CXXFLAGS ?= -O3 -march=native -DNDEBUG -std=c++17
-psie: psie.cpp runrank.hpp efrank.hpp libsais/src/libsais.c
+hybrid: hybrid.cpp runrank.hpp efrank.hpp huffwt.hpp libsais/src/libsais.c
 	gcc -O3 -march=native -DNDEBUG -c libsais/src/libsais.c -Ilibsais/include -o libsais.o
-	$(CXX) $(CXXFLAGS) -Ilibsais/include psie.cpp libsais.o -o psie
+	$(CXX) $(CXXFLAGS) -Ilibsais/include hybrid.cpp libsais.o -o hybrid
 clean:
-	rm -f psie libsais.o
+	rm -f hybrid libsais.o

@@ -1,4 +1,4 @@
-# psie: an FM-index / CSA hybrid for repetitive texts over large alphabets
+# Hybrid-FM-CSA: an FM-index / CSA hybrid for repetitive texts over large alphabets
 
 This is the prototype accompanying the note *Mixing FM-indexes and CSAs: backward search over an order-1 rank
 encoding* (Travis Gagie). It counts occurrences of patterns in a sequence of integers.
@@ -22,9 +22,9 @@ has them, and portable fallbacks otherwise.
 
 Inputs are binary files of little-endian unsigned integers, 4 bytes each by default.
 
-    ./psie build <input> <index> [width] [huff|ef|explicit]
-    ./psie count <index> <patterns.txt>
-    ./psie bench <input> [width] [queries] [m ...]
+    ./hybrid build <input> <index> [width] [huff|ef|explicit]
+    ./hybrid count <index> <patterns.txt>
+    ./hybrid bench <input> [width] [queries] [m ...]
 
 - `build` builds the hybrid index and writes it to `<index>`. `width` is the number of bytes per integer (1, 2, 4
   or 8). The last argument chooses the structure for BWT(E): `huff` (default, run-length Huffman-shaped wavelet
@@ -44,7 +44,7 @@ for example `python3 gen.py test.bin 1000 1000000 50 0.01` (requires numpy).
 
 ## Files
 
-- `psie.cpp`: encoding, index construction, counting, and the `build`, `count` and `bench` modes.
+- `hybrid.cpp`: encoding, index construction, counting, and the `build`, `count` and `bench` modes.
 - `runrank.hpp`: explicit per-character run lists (an uncompressed RLCSA).
 - `efrank.hpp`: Elias-Fano run lists (a compressed RLCSA, following Brown, Gagie, Manzini, Navarro and Sciortino,
   "Faster run-length compressed suffix arrays").
