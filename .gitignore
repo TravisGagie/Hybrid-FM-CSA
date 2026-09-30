@@ -1,0 +1,4 @@
+hybrid
+*.o
+*.bin
+*.idx
