@@ -229,6 +229,19 @@ struct RLHuffRank {
     inline void rank2(uint32_t c, uint64_t i1, uint64_t i2, uint64_t& r1, uint64_t& r2) const {
         r1 = rank(c, i1); r2 = rank(c, i2);
     }
+    // LF without a C array: C[c] + rank_c(i), since C[c] = FP[first[c]]
+    inline uint64_t lf(uint32_t c, uint64_t i) const {
+        if (c >= sigma) return n;
+        if (i == 0) return FP.access(first[c]);
+        uint64_t j = BL.count_less(i) - 1;
+        uint64_t q0, q1;
+        heads.rank2(c, j, j + 1, q0, q1);
+        uint64_t fq = FP.access(first[c] + q0);
+        return q1 > q0 ? fq + (i - BL.access(j)) : fq;
+    }
+    inline void lf2(uint32_t c, uint64_t i1, uint64_t i2, uint64_t& o1, uint64_t& o2) const {
+        o1 = lf(c, i1); o2 = lf(c, i2);
+    }
     uint64_t bytes() const { return heads.bytes() + BL.bytes() + FP.bytes() + first.size() * 4; }
     void save(FILE* f) const {
         fwrite(&n, 8, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&nruns, 8, 1, f);

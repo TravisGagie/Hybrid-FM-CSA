@@ -227,6 +227,24 @@ struct EFRank {
         r1 = a1 == b ? 0 : rank_from(b, a1, c, i1);
         r2 = a2 == b ? 0 : rank_from(b, a2, c, i2);
     }
+    // LF without a C array: C[c] + rank_c(i) at two positions.  The F position of c's
+    // first run is C[c], so the subtraction in rank_from cancels.
+    inline uint64_t lf_one(uint64_t base, uint64_t b, uint64_t i) const {
+        uint64_t a = i ? KS.count_less(base + (i > n ? n : i)) : b;
+        if (a == b) return b < nruns ? FP.access(b) : n;
+        uint64_t j = a - 1;
+        uint64_t start = KS.access(j) - base;
+        uint64_t f, fn;
+        if (j + 1 < nruns) FP.access2(j, f, fn); else { f = FP.access(j); fn = n; }
+        uint64_t len = fn - f, d = i - start;
+        return f + (d < len ? d : len);
+    }
+    inline void lf2(uint32_t c, uint64_t i1, uint64_t i2, uint64_t& o1, uint64_t& o2) const {
+        if (c >= sigma) { o1 = o2 = n; return; }
+        uint64_t base = (uint64_t)c * n;
+        uint64_t b = KS.count_less(base);
+        o1 = lf_one(base, b, i1); o2 = lf_one(base, b, i2);
+    }
     uint64_t bytes() const { return KS.bytes() + FP.bytes(); }
     void save(FILE* f) const {
         fwrite(&n, 8, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&nruns, 8, 1, f); KS.save(f); FP.save(f);

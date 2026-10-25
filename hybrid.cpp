@@ -305,6 +305,18 @@ struct Encoding {
     }
 };
 
+// LF step [l, r) -> [C[c] + rank_c(l), C[c] + rank_c(r)).  Rank structures that keep
+// F positions of their runs (Elias-Fano run lists, run-length Huffman WTs) do this
+// without a C array (method lf2); for the others C is passed in.
+template <class R, class = void> struct has_lf2 : std::false_type {};
+template <class R> struct has_lf2<R, std::void_t<decltype(std::declval<const R&>().lf2(0u, 0ull, 0ull,
+    std::declval<uint64_t&>(), std::declval<uint64_t&>()))>> : std::true_type {};
+template <class R, class CF>
+static inline void lf_step(const R& bwt, CF Cof, uint32_t c, uint64_t& l, uint64_t& r) {
+    if constexpr (has_lf2<R>::value) { uint64_t a, b; bwt.lf2(c, l, r, a, b); l = a; r = b; }
+    else { uint64_t rl, rr, cc = Cof(c); bwt.rank2(c, l, r, rl, rr); l = cc + rl; r = cc + rr; }
+}
+
 // ---------------------------------------------------------------- index
 template <class RB, class RP = RB>
 struct PsiEIndex {
@@ -326,9 +338,7 @@ struct PsiEIndex {
         for (size_t j = m - 1; j >= 1; --j) {          // backward search enc(P)[2..m]
             uint32_t c = enc->succ_rank(p[j - 1], p[j]);
             if (c == 0) return 0;
-            uint64_t rl, rr;
-            bwt.rank2(c, l, r, rl, rr);
-            l = enc->C[c] + rl; r = enc->C[c] + rr;
+            lf_step(bwt, [this](uint32_t x) { return enc->C[x]; }, c, l, r);
             if (l >= r) return 0;
         }
         uint64_t rl, rr;
@@ -343,29 +353,37 @@ struct PsiEIndex {
     uint64_t bytes() const { return enc->bytes() + bwt.bytes() + psi.bytes(); }
 };
 
-// Baseline: run-length FM-index of T$ with the same rank structure.
+// Baseline: run-length FM-index of T$ with the same rank structure (with Elias-Fano
+// run lists this is a compressed RLCSA of T).  A C array, Elias-Fano coded, is kept
+// only when the rank structure cannot supply C[c] itself.
 template <class R>
 struct RLFM {
     uint64_t n = 0;
-    vector<uint64_t> C;
+    EliasFano C;
     R bwt;
     void build(const vector<uint32_t>& L, const vector<uint64_t>& C_, uint32_t sigma) {
-        n = L.size(); C = C_;
+        n = L.size();
+        if (!has_lf2<R>::value) C.build(C_, n + 1);
         bwt.build(L, sigma + 1);
     }
+    inline void step(uint32_t c, uint64_t& l, uint64_t& r) const {
+        lf_step(bwt, [this](uint32_t x) { return C.access(x); }, c, l, r);
+    }
+    // the interval of the single symbol c
+    inline void range(uint32_t c, uint64_t& l, uint64_t& r) const { l = 0; r = n; step(c, l, r); }
     uint64_t count_ids(const vector<uint32_t>& p) const {
         uint64_t l = 0, r = n;
         for (size_t j = p.size(); j-- > 0;) {
             uint32_t c = p[j];
             if (c == 0) return 0;
-            uint64_t rl, rr;
-            bwt.rank2(c, l, r, rl, rr);
-            l = C[c] + rl; r = C[c] + rr;
+            step(c, l, r);
             if (l >= r) return 0;
         }
         return r - l;
     }
-    uint64_t bytes() const { return C.size() * 8 + bwt.bytes(); }
+    uint64_t bytes() const { return (has_lf2<R>::value ? 0 : C.bytes()) + bwt.bytes(); }
+    void save(FILE* f) const { fwrite(&n, 8, 1, f); bwt.save(f); if (!has_lf2<R>::value) C.save(f); }
+    void load(FILE* f) { if (fread(&n, 8, 1, f) != 1) exit(1); bwt.load(f); if (!has_lf2<R>::value) C.load(f); }
 };
 
 static void bwt_of_T(const vector<uint32_t>& T, uint32_t sigma, vector<uint32_t>& L, vector<uint64_t>& C) {
@@ -388,11 +406,11 @@ static uint64_t count_runs(const vector<uint32_t>& s) {
 
 // ---------------------------------------------------------------- modes
 static int do_build(int argc, char** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff|rlcsa]\n"); return 1; }
     int width = argc > 4 ? atoi(argv[4]) : 4;
     string kind = argc > 5 ? argv[5] : "huff";
-    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff") {
-        fprintf(stderr, "kind must be explicit, ef, huff or bihuff\n"); return 1;
+    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa") {
+        fprintf(stderr, "kind must be explicit, ef, huff, bihuff or rlcsa\n"); return 1;
     }
     auto t0 = clk::now();
     auto raw = read_ints(argv[2], width);
@@ -401,6 +419,33 @@ static int do_build(int argc, char** argv) {
     e.sigma = e.vals.size();
     e.compress_vals();
     vector<uint64_t>().swap(raw);
+    if (kind == "rlcsa") {              // RLCSAs (Elias-Fano run lists) of T and of T reversed
+        FILE* f = fopen(argv[3], "wb");
+        if (!f) { perror(argv[3]); return 1; }
+        fwrite("RLCSA001", 1, 8, f);
+        uint8_t c = e.consecutive;
+        fwrite(&e.sigma, 4, 1, f); fwrite(&c, 1, 1, f); fwrite(&e.vals_base, 8, 1, f);
+        RunRank::wv(f, e.vals);
+        uint64_t sz = e.vals.size() * 8, rf, rr;
+        {
+            vector<uint32_t> LT; vector<uint64_t> CT;
+            bwt_of_T(T, e.sigma, LT, CT);
+            rf = count_runs(LT);
+            RLFM<EFRank> fm; fm.build(LT, CT, e.sigma); fm.save(f); sz += fm.bytes();
+            printf("RLCSA of T: %llu runs, %s\n", (unsigned long long)rf, mb(fm.bytes()).c_str());
+        }
+        reverse(T.begin(), T.end());
+        {
+            vector<uint32_t> LT; vector<uint64_t> CT;
+            bwt_of_T(T, e.sigma, LT, CT);
+            rr = count_runs(LT);
+            RLFM<EFRank> fm; fm.build(LT, CT, e.sigma); fm.save(f); sz += fm.bytes();
+            printf("RLCSA of T reversed: %llu runs, %s\n", (unsigned long long)rr, mb(fm.bytes()).c_str());
+        }
+        fclose(f);
+        printf("n = %zu, sigma = %u; rlcsa index: %s, built in %.2fs\n", T.size() + 1, e.sigma, mb(sz).c_str(), secs(t0));
+        return 0;
+    }
     vector<uint32_t> L, P, Lrev;
     e.prepare(T, L, P, true, kind == "bihuff" ? &Lrev : nullptr);
     FILE* f = fopen(argv[3], "wb");
@@ -522,62 +567,109 @@ static QueryParse read_qenc(const char* fn) {
     return q;
 }
 
+// Search backends for MemFinder.
+//   EncBackend: the hybrid.  The interval of state a (match Q[a..j]) is that of
+//     R[a+1..j] in BWT(E), starting from the whole range; a backward step from a
+//     to a-1 is on R[a]; the first phrase Q[a] is checked against Psi_E.
+//   PlainBackend: RLCSAs (RLFMs with Elias-Fano run lists) of T and of T
+//     reversed.  The interval of state a is that of Q[a..j] itself, starting from
+//     the range of Q[j]; a backward step from a to a-1 is on Q[a-1].  Matches are
+//     exact, so there is nothing to check.
 template <class RB, class RP>
-struct MemFinder {
+struct EncBackend {
     const PsiEIndex<RB, RP>& ix;
     const Encoding& e;
-    const RB* rev = nullptr;            // index of the reversed encoding (forward search), if any
-    vector<uint32_t> Q;                 // dense ids, 0 = absent
-    vector<uint32_t> R;                 // R[a] = rank of Q[a] after Q[a-1], 0 if the pair never occurs
-    uint64_t steps = 0, fsteps = 0, checks = 0;   // backward steps, forward steps, rank queries on Psi_E
-    static constexpr uint64_t CHECK_EVERY = 16;
-    bool use_psi = true;                // false: encoded matches count as matches (no Psi_E)
-    uint64_t last_l = 0, last_r = 0;    // interval of R[a+1..j] for the start a last returned by an encoded longest_suffix
-
-    // "e-occurs": Q[a..b] e-occurs if Q[a] is present and R[a+1..b] occurs in the
-    // encoding.  Every occurrence is an e-occurrence; Q[a..b] occurs if moreover some
-    // e-occurrence is preceded by Q[a] (one rank query on Psi_E).
-    MemFinder(const PsiEIndex<RB, RP>& ix_, const QueryParse& q) : ix(ix_), e(*ix_.enc) {
-        uint64_t np = q.raw.size();
-        Q.assign(np, 0); R.assign(np, 0);
-        for (uint64_t t = 0; t < np; ++t) {
-            if (q.raw[t] == 0xFFFFFFFFu) continue;
-            int64_t id = e.id_of(q.raw[t]);
-            Q[t] = id < 0 ? 0 : (uint32_t)id;
-        }
-        for (uint64_t t = 1; t < np; ++t) if (Q[t - 1] && Q[t] && !q.first[t]) R[t] = e.succ_rank(Q[t - 1], Q[t]);
+    const RB* rev = nullptr;
+    static constexpr bool exact = false;
+    EncBackend(const PsiEIndex<RB, RP>& ix_, const RB* rev_) : ix(ix_), e(*ix_.enc), rev(rev_) {}
+    int64_t id_of(uint64_t raw) const { return e.id_of(raw); }
+    uint32_t pair_sym(uint32_t a, uint32_t b) const { return e.succ_rank(a, b); }   // R for (a, b), 0 if absent
+    void init(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
+    void finit(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
+    inline bool step(uint32_t c, uint64_t& l, uint64_t& r) const {
+        lf_step(ix.bwt, [this](uint32_t x) { return e.C[x]; }, c, l, r); return l < r;
     }
-    inline bool step(uint32_t c, uint64_t& l, uint64_t& r) {        // backward step in BWT(E)
-        ++steps;
-        uint64_t rl, rr;
-        ix.bwt.rank2(c, l, r, rl, rr);
-        l = e.C[c] + rl; r = e.C[c] + rr;
-        return l < r;
+    inline bool fstep(uint32_t c, uint64_t& l, uint64_t& r) const {   // same symbol counts as E
+        lf_step(*rev, [this](uint32_t x) { return e.C[x]; }, c, l, r); return l < r;
     }
-    inline bool fstep(uint32_t c, uint64_t& l, uint64_t& r) {       // backward step in BWT(E reversed)
-        ++fsteps;
-        uint64_t rl, rr;
-        rev->rank2(c, l, r, rl, rr);
-        l = e.C[c] + rl; r = e.C[c] + rr;       // same symbol counts as E
-        return l < r;
-    }
-    inline bool precedes(uint32_t a, uint64_t l, uint64_t r, bool truth) {
-        if (!truth) return true;
-        ++checks;
+    inline bool precedes(uint32_t a, uint64_t l, uint64_t r) const {
         uint64_t rl, rr;
         ix.psi.rank2(a, l, r, rl, rr);
         return rr > rl;
     }
+};
+struct PlainIndex {
+    Encoding map;                       // only the map from input values to dense ids
+    RLFM<EFRank> fwd, rev;
+    bool have_rev = false;
+    uint64_t bytes() const { return map.vals.size() * 8 + fwd.bytes() + (have_rev ? rev.bytes() : 0); }
+};
+struct PlainBackend {
+    const PlainIndex& ix;
+    const RLFM<EFRank>* rev = nullptr;
+    static constexpr bool exact = true;
+    PlainBackend(const PlainIndex& ix_, const RLFM<EFRank>* rev_) : ix(ix_), rev(rev_) {}
+    int64_t id_of(uint64_t raw) const { return ix.map.id_of(raw); }
+    uint32_t pair_sym(uint32_t a, uint32_t) const { return a; }
+    void init(uint32_t q, uint64_t& l, uint64_t& r) const { ix.fwd.range(q, l, r); }
+    void finit(uint32_t q, uint64_t& l, uint64_t& r) const { rev->range(q, l, r); }
+    inline bool step(uint32_t c, uint64_t& l, uint64_t& r) const { ix.fwd.step(c, l, r); return l < r; }
+    inline bool fstep(uint32_t c, uint64_t& l, uint64_t& r) const { rev->step(c, l, r); return l < r; }
+    inline bool precedes(uint32_t, uint64_t, uint64_t) const { return true; }
+};
+
+template <class BE>
+struct MemFinder {
+    const BE& be;
+    bool rev = false;                   // forward search available
+    vector<uint32_t> Q;                 // dense ids, 0 = absent
+    // R[t]: backward step from state t to t-1 (0 = impossible: a phrase absent, the pair
+    // never occurs, or t starts a segment); F[t]: forward step from t-1 to t.
+    // Hybrid: both are the rank of Q[t] after Q[t-1].  Plain: R[t] = Q[t-1], F[t] = Q[t].
+    vector<uint32_t> R, F;
+    uint64_t steps = 0, fsteps = 0, checks = 0;   // backward steps, forward steps, rank queries on Psi_E
+    static constexpr uint64_t CHECK_EVERY = 16;
+    bool use_psi = true;                // false: encoded matches count as matches (no Psi_E)
+    uint64_t last_l = 0, last_r = 0;    // interval of the state last returned by an encoded longest_suffix
+
+    // "e-occurs": Q[a..b] e-occurs if Q[a] is present and R[a+1..b] occurs in the
+    // encoding.  Every occurrence is an e-occurrence; Q[a..b] occurs if moreover some
+    // e-occurrence is preceded by Q[a] (one rank query on Psi_E).  With the plain
+    // backend e-occurrence is occurrence.
+    MemFinder(const BE& be_, const QueryParse& q, bool have_rev) : be(be_), rev(have_rev) {
+        uint64_t np = q.raw.size();
+        Q.assign(np, 0); R.assign(np, 0); F.assign(np, 0);
+        for (uint64_t t = 0; t < np; ++t) {
+            if (q.raw[t] == 0xFFFFFFFFu) continue;
+            int64_t id = be.id_of(q.raw[t]);
+            Q[t] = id < 0 ? 0 : (uint32_t)id;
+        }
+        for (uint64_t t = 1; t < np; ++t) if (Q[t - 1] && Q[t] && !q.first[t]) {
+            if (BE::exact) { R[t] = Q[t - 1]; F[t] = Q[t]; }
+            else R[t] = F[t] = be.pair_sym(Q[t - 1], Q[t]);
+        }
+        if (BE::exact) use_psi = false;
+    }
+    inline bool step(uint32_t c, uint64_t& l, uint64_t& r) { ++steps; return be.step(c, l, r); }
+    inline bool fstep(uint32_t c, uint64_t& l, uint64_t& r) { ++fsteps; return be.fstep(c, l, r); }
+    inline bool precedes(uint32_t a, uint64_t l, uint64_t r, bool truth) {
+        if (!truth) return true;
+        ++checks;
+        return be.precedes(a, l, r);
+    }
     bool occurs(uint64_t a, uint64_t b, bool truth) {
-        if (!Q[a]) return false;
-        uint64_t l = 0, r = e.n0;
+        if (!Q[a] || !Q[b]) return false;
+        uint64_t l, r;
+        be.init(Q[b], l, r);
         for (uint64_t x = b; x > a; --x) if (!R[x] || !step(R[x], l, r)) return false;
         return a == b || precedes(Q[a], l, r, truth);
     }
     // smallest i >= floor such that Q[i..j] occurs (truth) or e-occurs; Q[j] must be present
     uint64_t longest_suffix(uint64_t j, uint64_t floor, bool truth) {
-        vector<pair<uint64_t, uint64_t>> ivl{{0, e.n0}};   // ivl[d]: interval of R[j-d+1..j]
-        uint64_t good = j, a = j, l = 0, r = e.n0;
+        uint64_t l, r;
+        be.init(Q[j], l, r);
+        vector<pair<uint64_t, uint64_t>> ivl{{l, r}};      // ivl[d]: interval of state j-d
+        uint64_t good = j, a = j;
         bool bad = false;
         while (a > floor && Q[a - 1] && R[a]) {
             if (!step(R[a], l, r)) break;
@@ -602,8 +694,9 @@ struct MemFinder {
     }
     // largest j <= cap such that Q[p..j] e-occurs, by forward search (Q[p] present)
     uint64_t forward_extend(uint64_t p, uint64_t cap) {
-        uint64_t j = p, l = 0, r = e.n0;
-        while (j < cap && R[j + 1] && fstep(R[j + 1], l, r)) ++j;
+        uint64_t j = p, l, r;
+        be.finit(Q[p], l, r);
+        while (j < cap && F[j + 1] && fstep(F[j + 1], l, r)) ++j;
         return j;
     }
     // largest j' in [p, cap] such that Q[p..j'] occurs (truth) or e-occurs
@@ -705,18 +798,8 @@ struct MemFinder {
     }
 };
 
-template <class RB, class RP>
-static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
-    PsiEIndex<RB, RP> ix;
-    ix.enc = &e;
-    ix.bwt.load(f); ix.psi.load(f);
-    RB rev;
-    bool have_rev = false;
-    {
-        char mg[8];
-        if (fread(mg, 1, 8, f) == 8 && !memcmp(mg, "REVBWT01", 8)) { rev.load(f); have_rev = true; }
-    }
-    fclose(f);
+template <class BE>
+static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
     bool use_psi = true, one_way = false;
     uint64_t minlen = 0;                // -L: only pseudo-MEMs of at least this many characters
     vector<string> qfiles;
@@ -730,9 +813,9 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
     for (auto& qfn : qfiles) {
         QueryParse q = read_qenc(qfn.c_str());
         auto t0 = clk::now();
-        MemFinder<RB, RP> mf(ix, q);
-        mf.use_psi = use_psi;
-        if (have_rev && !one_way) mf.rev = &rev;
+        MemFinder<BE> mf(be, q, have_rev && !one_way);
+        if (!BE::exact) mf.use_psi = use_psi;
+        bool exact = BE::exact || use_psi;      // reported parse MEMs are true parse MEMs
         uint64_t np = q.raw.size();
         auto pstart = [&](uint64_t t) { return q.start[t]; };
         auto pend = [&](uint64_t t) { return q.last[t] ? q.segend[t] : q.start[t + 1]; };   // non-overlapping end
@@ -752,7 +835,7 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
         for (auto [i, j] : ms) {
             uint64_t b = pm_begin(i), en = pm_end(j);
             uint64_t lb = (q.overlap ? (q.last[j] ? q.segend[j] : min<uint64_t>(q.segend[j], q.start[j + 1] + ext)) : pend(j)) - pstart(i);
-            if (!use_psi) {             // only single phrases and pairs of consecutive phrases are known to occur
+            if (!exact) {               // only single phrases and pairs of consecutive phrases are known to occur
                 lb = pend(i) - pstart(i);
                 for (uint64_t t = i + 1; t <= j; ++t) lb = max<uint64_t>(lb, pend(t) - pstart(t - 1));
             }
@@ -770,7 +853,7 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
             if (en - pstart(t) >= minlen) pm.push_back({pstart(t), en, 0, t, q.last[t] ? t : t + 1, true});
         }
         sort(pm.begin(), pm.end(), [](const PM& x, const PM& y) { return x.b != y.b ? x.b < y.b : x.e < y.e; });
-        string ofn = qfn + (use_psi ? "" : ".nopsi") + (minlen ? ".L" + to_string(minlen) : string()) +
+        string ofn = qfn + (BE::exact ? ".rlcsa" : use_psi ? "" : ".nopsi") + (minlen ? ".L" + to_string(minlen) : string()) +
                      (have_rev && one_way ? ".oneway" : "") + ".pmems.tsv";
         FILE* fo = fopen(ofn.c_str(), "w");
         if (!fo) { perror(ofn.c_str()); return 1; }
@@ -804,12 +887,44 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
     return 0;
 }
 
+template <class RB, class RP>
+static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
+    PsiEIndex<RB, RP> ix;
+    ix.enc = &e;
+    ix.bwt.load(f); ix.psi.load(f);
+    RB rev;
+    bool have_rev = false;
+    {
+        char mg[8];
+        if (fread(mg, 1, 8, f) == 8 && !memcmp(mg, "REVBWT01", 8)) { rev.load(f); have_rev = true; }
+    }
+    fclose(f);
+    printf("hybrid index: %s (%s)\n", mb(ix.bytes() + (have_rev ? rev.bytes() : 0)).c_str(),
+           have_rev ? "with BWT of the reversed encoding" : "backward only");
+    EncBackend<RB, RP> be(ix, have_rev ? &rev : nullptr);
+    return mems_queries(be, have_rev, argc, argv);
+}
+static int mems_plain(FILE* f, int argc, char** argv) {
+    PlainIndex ix;
+    uint8_t c;
+    if (fread(&ix.map.sigma, 4, 1, f) != 1 || fread(&c, 1, 1, f) != 1 || fread(&ix.map.vals_base, 8, 1, f) != 1) exit(1);
+    ix.map.consecutive = c;
+    RunRank::rv(f, ix.map.vals);
+    ix.fwd.load(f);
+    ix.rev.load(f); ix.have_rev = true;
+    fclose(f);
+    printf("RLCSA index: %s (forward %s, reversed %s)\n", mb(ix.bytes()).c_str(), mb(ix.fwd.bytes()).c_str(), mb(ix.rev.bytes()).c_str());
+    PlainBackend be(ix, &ix.rev);
+    return mems_queries(be, true, argc, argv);
+}
+
 static int do_mems(int argc, char** argv) {
     if (argc < 4) { fprintf(stderr, "usage: hybrid mems <index> [--no-psi] [--one-way] [-L min_length] <query.qenc> ...\n"); return 1; }
     FILE* f = fopen(argv[2], "rb");
     if (!f) { perror(argv[2]); return 1; }
     char mg[8];
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
+    if (!memcmp(mg, "RLCSA001", 8)) return mems_plain(f, argc, argv);
     Encoding e;
     e.load(f);
     if (!memcmp(mg, "PSIEX003", 8)) return mems_with<RunRank, RunRank>(f, e, argc, argv);
