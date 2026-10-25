@@ -1220,6 +1220,117 @@ static int do_bench(int argc, char** argv) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------- blocks (statistics)
+// Statistics for the block index: s(x) = the most frequent successor of x (ties: smaller
+// id).  E[i] = # if T[i] = s(T[i-1]) (and T[i-1] is not a separator), else T[i].  A block is
+// a real character d followed by its j hashes; the block sequence is indexed with block
+// symbols ordered by (d ascending, j descending).  H lists, for the suffixes of E that start
+// with #, the character that # stands for, in suffix order; Psi_E lists T[p-1] for every
+// suffix.  Reports run counts and how many steps searches would take.
+static int do_blocks(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "usage: hybrid blocks <input> [width]\n"); return 1; }
+    int width = argc > 3 ? atoi(argv[3]) : 4;
+    auto t0 = clk::now();
+    auto raw = read_ints(argv[2], width);
+    vector<uint64_t> vals;
+    auto T = densify(raw, vals);
+    vector<uint64_t>().swap(raw);
+    uint32_t sigma = vals.size();
+    uint32_t sep = (!vals.empty() && vals[0] == 0) ? 1 : 0;      // dense id of the separator, 0 if none
+    uint64_t n = T.size();
+    // top successors
+    vector<uint32_t> top(sigma + 1, 0);
+    {
+        vector<uint64_t> pr; pr.reserve(n);
+        for (uint64_t i = 0; i + 1 < n; ++i) if (T[i] != sep) pr.push_back((uint64_t)T[i] << 32 | T[i + 1]);
+        sort(pr.begin(), pr.end());
+        uint64_t best = 0;
+        for (size_t i = 0; i < pr.size();) {
+            size_t j = i; while (j < pr.size() && pr[j] == pr[i]) ++j;
+            uint32_t a = pr[i] >> 32, b = (uint32_t)pr[i];
+            if (top[a] == 0 || j - i > best) { if (top[a] == 0 || (j - i) > best) { top[a] = b; best = j - i; } }
+            i = j;
+            if (i < pr.size() && (pr[i] >> 32) != a) best = 0;
+        }
+    }
+    // E: 0 = #, x+1 = real character x (separators are always real); terminator appended later
+    vector<uint8_t> hash(n, 0);
+    uint64_t nh = 0;
+    for (uint64_t i = 1; i < n; ++i) if (T[i - 1] != sep && T[i] != sep && T[i] == top[T[i - 1]]) { hash[i] = 1; ++nh; }
+    // blocks
+    vector<uint64_t> bkey;              // (d, j) packed
+    {
+        uint64_t i = 0;
+        while (i < n) {
+            uint64_t j = i + 1;
+            while (j < n && hash[j]) ++j;
+            bkey.push_back((uint64_t)T[i] << 32 | (uint32_t)(j - i - 1));
+            i = j;
+        }
+    }
+    uint64_t nb = bkey.size(), maxj = 0;
+    for (auto k : bkey) maxj = max<uint64_t>(maxj, (uint32_t)k);
+    // block symbols ordered by d ascending, j descending: key d << 32 | (2^32-1 - j)
+    vector<uint64_t> ord(bkey.size());
+    for (size_t i = 0; i < nb; ++i) ord[i] = (bkey[i] >> 32) << 32 | (0xFFFFFFFFull - (uint32_t)bkey[i]);
+    vector<uint64_t> u(ord); sort(u.begin(), u.end()); u.erase(unique(u.begin(), u.end()), u.end());
+    uint64_t sigB = u.size();
+    vector<uint32_t> B(nb);
+    for (size_t i = 0; i < nb; ++i) B[i] = (uint32_t)(lower_bound(u.begin(), u.end(), ord[i]) - u.begin()) + 1;
+    vector<uint64_t>().swap(ord); vector<uint64_t>().swap(bkey);
+    printf("n = %llu phrases, sigma = %u; hashes %.2f%%; blocks %llu (%.2f%% of n, %.2f phrases per block); "
+           "distinct block symbols %llu; longest run of hashes %llu\n",
+           (unsigned long long)n, sigma, 100.0 * nh / max<uint64_t>(n, 1), (unsigned long long)nb, 100.0 * nb / max<uint64_t>(n, 1),
+           (double)n / max<uint64_t>(nb, 1), (unsigned long long)sigB, (unsigned long long)maxj);
+    fflush(stdout);
+    // BWT of T (for comparison), of the block sequence, and of E with H and Psi_E
+    auto runs_of_bwt = [&](const vector<uint32_t>& S, uint64_t k, vector<int32_t>* keepSA) -> uint64_t {
+        uint64_t m = S.size() + 1;
+        vector<int32_t> X(m), SA(m + 6 * (size_t)(k + 1));
+        for (uint64_t i = 0; i + 1 < m; ++i) X[i] = S[i];
+        X[m - 1] = 0;
+        if (libsais_int(X.data(), SA.data(), m, k + 1, 6 * (k + 1)) != 0) { fprintf(stderr, "libsais failed\n"); exit(1); }
+        uint64_t r = 0; int32_t prev = -1;
+        for (uint64_t q = 0; q < m; ++q) { int32_t c = X[SA[q] ? SA[q] - 1 : m - 1]; r += (c != prev); prev = c; }
+        if (keepSA) { SA.resize(m); keepSA->swap(SA); }
+        return r;
+    };
+    uint64_t rT = runs_of_bwt(T, sigma, nullptr);
+    uint64_t rB = runs_of_bwt(B, sigB, nullptr);
+    vector<uint32_t>().swap(B);
+    vector<uint32_t> E(n);
+    for (uint64_t i = 0; i < n; ++i) E[i] = hash[i] ? 1 : T[i] + 1;      // 1 = #, real x -> x+1
+    vector<int32_t> SA;
+    uint64_t rE = runs_of_bwt(E, sigma + 1, &SA);
+    // H: for rows whose suffix starts with #, T[p]; Psi_E: T[p-1] for all rows
+    uint64_t rH = 0, nH = 0, rP = 0, rPh = 0;
+    {
+        uint32_t ph = UINT32_MAX, pp = UINT32_MAX, pph = UINT32_MAX;
+        for (uint64_t q = 0; q < SA.size(); ++q) {
+            uint64_t p = SA[q];
+            if (p >= n) continue;                            // terminator row
+            uint32_t prevc = p ? T[p - 1] : 0;
+            if (prevc != pp) { ++rP; pp = prevc; }
+            if (hash[p]) {
+                ++nH;
+                if (T[p] != ph) { ++rH; ph = T[p]; }
+                if (prevc != pph) { ++rPh; pph = prevc; }
+            }
+        }
+    }
+    printf("runs: BWT(T) = %llu; block BWT = %llu (%.2f x BWT(T)); BWT(E) = %llu; "
+           "H = %llu over %llu hash rows (%.2f x BWT(T)); Psi_E = %llu (on hash rows %llu)\n",
+           (unsigned long long)rT, (unsigned long long)rB, (double)rB / max<uint64_t>(rT, 1), (unsigned long long)rE,
+           (unsigned long long)rH, (unsigned long long)nH, (double)rH / max<uint64_t>(rT, 1),
+           (unsigned long long)rP, (unsigned long long)rPh);
+    // block BWT + H together, against BWT(T)
+    printf("block BWT + H runs = %.2f x BWT(T); a search takes %.2f phrases per step (blocks)\n",
+           (double)(rB + rH) / max<uint64_t>(rT, 1), (double)n / max<uint64_t>(nb, 1));
+    printf("time %.1fs\n", secs(t0));
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: hybrid build|count|bench|mems ...\n"); return 1; }
     string mode = argv[1];
@@ -1227,6 +1338,7 @@ int main(int argc, char** argv) {
     if (mode == "count") return do_count(argc, argv);
     if (mode == "bench") return do_bench(argc, argv);
     if (mode == "mems") return do_mems(argc, argv);
+    if (mode == "blocks") return do_blocks(argc, argv);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
