@@ -253,3 +253,63 @@ struct RLHuffRank {
         heads.load(f); BL.load(f); FP.load(f); EliasFano::rv(f, first);
     }
 };
+
+// Rank structure for the capped encoding, whose alphabet is the ranks 1..cap (and 0)
+// followed by the escapes cap+1..cap+sigma.  The ranks and a single escape symbol
+// ESC = cap+1 go in a run-length Huffman WT (top); the escaped values, in the order
+// they appear in the sequence, go in Elias-Fano run lists (sub).  Since the escapes
+// are the largest symbols, C[cap+b] = C_top[ESC] + C_sub[b], so an LF step on an
+// escape is an LF step on ESC in top followed by one on b in sub; no per-symbol
+// arrays over the escapes are needed.
+struct EscRank {
+    uint32_t cap = 0, sigma = 0;
+    uint64_t n = 0;
+    RLHuffRank top;
+    EFRank sub;
+    bool has_sub = false;
+
+    void build(const std::vector<uint32_t>& s, uint32_t sig) {
+        n = s.size(); sigma = sig;
+        std::vector<uint32_t> t(n), e;
+        uint32_t maxb = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            if (s[i] > cap) { t[i] = cap + 1; e.push_back(s[i] - cap); maxb = std::max(maxb, s[i] - cap); }
+            else t[i] = s[i];
+        }
+        top.build(t, cap + 2);
+        has_sub = !e.empty();
+        if (has_sub) sub.build(e, maxb + 1);
+    }
+    inline uint64_t lf(uint32_t c, uint64_t i) const {
+        if (c <= cap) return top.lf(c, i);
+        uint64_t base = top.lf(cap + 1, 0);                 // C_top[ESC]
+        if (!has_sub) return base;
+        uint64_t j = top.lf(cap + 1, i) - base;             // escapes before i
+        uint64_t o1, o2;
+        sub.lf2(c - cap, j, j, o1, o2);
+        return base + o1;
+    }
+    inline void lf2(uint32_t c, uint64_t i1, uint64_t i2, uint64_t& o1, uint64_t& o2) const {
+        if (c <= cap) { top.lf2(c, i1, i2, o1, o2); return; }
+        uint64_t base = top.lf(cap + 1, 0);
+        if (!has_sub) { o1 = o2 = base; return; }
+        uint64_t j1, j2;
+        top.lf2(cap + 1, i1, i2, j1, j2);
+        uint64_t a, b;
+        sub.lf2(c - cap, j1 - base, j2 - base, a, b);
+        o1 = base + a; o2 = base + b;
+    }
+    uint64_t bytes() const { return top.bytes() + (has_sub ? sub.bytes() : 0); }
+    void save(FILE* f) const {
+        fwrite(&cap, 4, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&n, 8, 1, f);
+        uint8_t h = has_sub; fwrite(&h, 1, 1, f);
+        top.save(f); if (has_sub) sub.save(f);
+    }
+    void load(FILE* f) {
+        uint8_t h;
+        if (fread(&cap, 4, 1, f) != 1 || fread(&sigma, 4, 1, f) != 1 || fread(&n, 8, 1, f) != 1 ||
+            fread(&h, 1, 1, f) != 1) throw std::runtime_error("read");
+        has_sub = h;
+        top.load(f); if (has_sub) sub.load(f);
+    }
+};

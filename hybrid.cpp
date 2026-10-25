@@ -125,7 +125,8 @@ struct Encoding {
     vector<uint64_t> soff;
     vector<uint32_t> sb, srank;
     // Compact rank lists, used after building:
-    //   off[a]: index of a's first successor (32 bits per phrase);
+    //   offs: Elias-Fano list of the index of each phrase's first successor (about
+    //     2 + lg(bigrams/sigma) bits per phrase);
     //   csucc: the successors, ceil(lg(sigma+1)) bits each.  For a phrase with
     //     d <= SMALL successors they are stored in rank order, so the rank of b
     //     is its position + 1 (found by a short linear scan, with no rank stored).
@@ -135,7 +136,7 @@ struct Encoding {
     // A lookup costs about one cache miss for small degrees.
     static constexpr uint64_t SMALL = 16;
     bool compact = false;
-    vector<uint32_t> off;
+    EliasFano offs;
     uint32_t wsucc = 0, wbig = 0;
     BitArray csucc, bigranks;
     vector<uint32_t> bigA;
@@ -153,6 +154,17 @@ struct Encoding {
         if (it == vals.end() || *it != raw) return -1;
         return (it - vals.begin()) + 1;
     }
+    // Capped rank lists (cap > 0): only each phrase's cap most frequent successors are
+    // ranked.  A pair (a, b) whose b is not among them is encoded as the escape cap + b,
+    // which names b itself, so E[i] still determines T[i] given T[i-1]; the rank lists
+    // hold at most sigma * cap entries.  cap = 0: no cap.
+    uint32_t cap = 0;
+    // the symbol of E for the pair (a, b): its rank, its escape, or 0 if (a, b) is known not to occur
+    inline uint32_t encode(uint32_t a, uint32_t b) const {
+        uint32_t r = succ_rank(a, b);
+        if (r || !cap || !b || b > sigma) return r;
+        return cap + b;
+    }
     uint32_t succ_rank(uint32_t a, uint32_t b) const {
         if (!compact) {
             const uint32_t* lo = sb.data() + soff[a];
@@ -162,7 +174,9 @@ struct Encoding {
             return srank[it - sb.data()];
         }
         if (a > sigma) return 0;
-        uint64_t lo = off[a], hi = off[a + 1], d = hi - lo;
+        uint64_t lo, hi;
+        offs.access2(a, lo, hi);
+        uint64_t d = hi - lo;
         if (d == 0) return 0;
         if (d <= SMALL) {
             for (uint64_t j = 0; j < d; ++j) if (csucc.get((lo + j) * wsucc, wsucc) == b) return (uint32_t)j + 1;
@@ -180,7 +194,7 @@ struct Encoding {
     void compress_ranks() {
         nbigrams = sb.size();
         if (nbigrams >= (1ull << 32)) { fprintf(stderr, "too many distinct pairs\n"); exit(1); }
-        off.assign(soff.begin(), soff.end());
+        offs.build(soff, nbigrams + 1);
         wsucc = bits_for(sigma);
         csucc.init(nbigrams * wsucc);
         uint64_t maxd = 0, nbig = 0;
@@ -239,17 +253,22 @@ struct Encoding {
                                                     : grp[x].second < grp[y].second; });
             vector<uint32_t> rk(grp.size());
             for (size_t q = 0; q < ord.size(); ++q) rk[ord[q]] = q + 1;
-            for (size_t q = 0; q < grp.size(); ++q) { sb.push_back(grp[q].second); srank.push_back(rk[q]); }
-            kE = max<uint32_t>(kE, grp.size() + 1);
+            for (size_t q = 0; q < grp.size(); ++q) {
+                if (cap && rk[q] > cap) continue;          // escaped: not in the lists
+                sb.push_back(grp[q].second); srank.push_back(rk[q]);
+            }
+            kE = max<uint32_t>(kE, (cap ? min<uint32_t>(grp.size(), cap) : grp.size()) + 1);
         }
         soff[sigma + 1] = sb.size();
         vector<uint64_t>().swap(pr);
+        if (cap) kE = cap + sigma + 1;              // ranks 1..cap, escapes cap+1..cap+sigma
 
         vector<int32_t> S(n0);
-        for (uint64_t k = 0; k + 1 < n0; ++k) S[k] = succ_rank(T[k], T[k + 1]);
+        uint64_t nesc = 0;
+        for (uint64_t k = 0; k + 1 < n0; ++k) { S[k] = encode(T[k], T[k + 1]); nesc += (uint32_t)S[k] > cap && cap; }
         if (n0) S[n0 - 1] = 0;
-        if (verbose) fprintf(stderr, "  encoded (%.2fs): %zu distinct bigrams, E alphabet %u\n",
-                             secs(t0), sb.size(), kE);
+        if (verbose) fprintf(stderr, "  encoded (%.2fs): %zu ranked bigrams, E alphabet %u%s\n",
+                             secs(t0), sb.size(), kE, cap ? (", cap " + to_string(cap) + ", " + to_string(nesc) + " escapes").c_str() : "");
         compress_ranks();
         t0 = clk::now();
         vector<int32_t> SA(n0 + 6 * (size_t)kE);
@@ -282,24 +301,29 @@ struct Encoding {
             if (verbose) fprintf(stderr, "  BWT of the reversed encoding built\n");
         }
     }
-    uint64_t bytes() const {
-        return vals.size() * 8 + C.size() * 8 + off.size() * 4 + csucc.a.size() * 8 + bigranks.a.size() * 8 +
+    // (C is needed only by rank structures that cannot supply C[c] themselves)
+    uint64_t bytes(bool withC = true) const {
+        return vals.size() * 8 + (withC ? C.size() * 8 : 0) + offs.bytes() + csucc.a.size() * 8 + bigranks.a.size() * 8 +
                bigA.size() * 4 + bigstart.size() * 8 + 64;
     }
     void save(FILE* f) const {
         fwrite(&sigma, 4, 1, f); fwrite(&kE, 4, 1, f); fwrite(&n0, 8, 1, f);
         uint8_t c = consecutive; fwrite(&c, 1, 1, f); fwrite(&vals_base, 8, 1, f);
-        fwrite(&wsucc, 4, 1, f); fwrite(&wbig, 4, 1, f); fwrite(&nbigrams, 8, 1, f);
-        RunRank::wv(f, vals); RunRank::wv(f, C); RunRank::wv(f, off);
+        fwrite(&wsucc, 4, 1, f); fwrite(&wbig, 4, 1, f); fwrite(&nbigrams, 8, 1, f); fwrite(&cap, 4, 1, f);
+        RunRank::wv(f, vals); RunRank::wv(f, C); offs.save(f);
         RunRank::wv(f, csucc.a); RunRank::wv(f, bigranks.a); RunRank::wv(f, bigA); RunRank::wv(f, bigstart);
     }
-    void load(FILE* f) {
+    void load(FILE* f, int version = 4) {
         uint8_t c;
         if (fread(&sigma, 4, 1, f) != 1 || fread(&kE, 4, 1, f) != 1 || fread(&n0, 8, 1, f) != 1 ||
             fread(&c, 1, 1, f) != 1 || fread(&vals_base, 8, 1, f) != 1 || fread(&wsucc, 4, 1, f) != 1 ||
             fread(&wbig, 4, 1, f) != 1 || fread(&nbigrams, 8, 1, f) != 1) exit(1);
+        cap = 0;
+        if (version >= 4 && fread(&cap, 4, 1, f) != 1) exit(1);
         consecutive = c;
-        RunRank::rv(f, vals); RunRank::rv(f, C); RunRank::rv(f, off);
+        RunRank::rv(f, vals); RunRank::rv(f, C);
+        if (version >= 4) offs.load(f);
+        else { vector<uint32_t> o; RunRank::rv(f, o); offs.build(vector<uint64_t>(o.begin(), o.end()), nbigrams + 1); }
         RunRank::rv(f, csucc.a); RunRank::rv(f, bigranks.a); RunRank::rv(f, bigA); RunRank::rv(f, bigstart);
         compact = true;
     }
@@ -326,6 +350,7 @@ struct PsiEIndex {
 
     void build(const Encoding& e, const vector<uint32_t>& L, const vector<uint32_t>& P) {
         enc = &e;
+        if constexpr (std::is_same_v<RB, EscRank>) bwt.cap = e.cap;
         bwt.build(L, e.kE);
         psi.build(P, e.sigma + 1);
     }
@@ -336,7 +361,7 @@ struct PsiEIndex {
         for (auto x : p) if (x == 0) return 0;
         uint64_t l = 0, r = enc->n0;
         for (size_t j = m - 1; j >= 1; --j) {          // backward search enc(P)[2..m]
-            uint32_t c = enc->succ_rank(p[j - 1], p[j]);
+            uint32_t c = enc->encode(p[j - 1], p[j]);
             if (c == 0) return 0;
             lf_step(bwt, [this](uint32_t x) { return enc->C[x]; }, c, l, r);
             if (l >= r) return 0;
@@ -350,7 +375,7 @@ struct PsiEIndex {
         for (size_t j = 0; j < p.size(); ++j) { int64_t id = enc->id_of(p[j]); q[j] = id < 0 ? 0 : id; }
         return count_ids(q);
     }
-    uint64_t bytes() const { return enc->bytes() + bwt.bytes() + psi.bytes(); }
+    uint64_t bytes() const { return enc->bytes(!has_lf2<RB>::value) + bwt.bytes() + psi.bytes(); }
 };
 
 // Baseline: run-length FM-index of T$ with the same rank structure (with Elias-Fano
@@ -406,15 +431,18 @@ static uint64_t count_runs(const vector<uint32_t>& s) {
 
 // ---------------------------------------------------------------- modes
 static int do_build(int argc, char** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff|rlcsa|birlcsa]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff|rlcsa|birlcsa] [cap]\n"); return 1; }
     int width = argc > 4 ? atoi(argv[4]) : 4;
     string kind = argc > 5 ? argv[5] : "huff";
+    uint32_t cap = argc > 6 ? (uint32_t)atoi(argv[6]) : 0;
+    if (cap && kind != "huff" && kind != "ef") { fprintf(stderr, "a cap needs kind huff or ef\n"); return 1; }
     if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa" && kind != "birlcsa") {
         fprintf(stderr, "kind must be explicit, ef, huff, bihuff, rlcsa or birlcsa\n"); return 1;
     }
     auto t0 = clk::now();
     auto raw = read_ints(argv[2], width);
     Encoding e;
+    e.cap = cap;
     auto T = densify(raw, e.vals);
     e.sigma = e.vals.size();
     e.compress_vals();
@@ -451,12 +479,22 @@ static int do_build(int argc, char** argv) {
     e.prepare(T, L, P, true, kind == "bihuff" ? &Lrev : nullptr);
     FILE* f = fopen(argv[3], "wb");
     if (!f) { perror(argv[3]); return 1; }
-    fwrite(kind == "explicit" ? "PSIEX003" : kind == "ef" ? "PSIEF003" : "PSIEH003", 1, 8, f);
+    bool esc = cap && kind == "huff";
+    fwrite(kind == "explicit" ? "PSIEX004" : kind == "ef" ? "PSIEF004" : esc ? "PSIEC004" : "PSIEH004", 1, 8, f);
     e.save(f);
     uint64_t sz;
     if (kind == "explicit") { PsiEIndex<RunRank> ix; ix.build(e, L, P); ix.bwt.save(f); ix.psi.save(f); sz = ix.bytes(); }
     else if (kind == "ef")  { PsiEIndex<EFRank> ix;  ix.build(e, L, P); ix.bwt.save(f); ix.psi.save(f); sz = ix.bytes(); }
-    else { PsiEIndex<RLHuffRank, EFRank> ix; ix.build(e, L, P); ix.bwt.save(f); ix.psi.save(f); sz = ix.bytes(); }
+    else if (esc) {
+        PsiEIndex<EscRank, EFRank> ix; ix.build(e, L, P); ix.bwt.save(f); ix.psi.save(f); sz = ix.bytes();
+        printf("BWT(E) %s (ranks and ESC %s, escapes %s), Psi_E %s, rank lists %s\n", mb(ix.bwt.bytes()).c_str(),
+               mb(ix.bwt.top.bytes()).c_str(), mb(ix.bwt.has_sub ? ix.bwt.sub.bytes() : 0).c_str(),
+               mb(ix.psi.bytes()).c_str(), mb(e.bytes(false)).c_str());
+    }
+    else {
+        PsiEIndex<RLHuffRank, EFRank> ix; ix.build(e, L, P); ix.bwt.save(f); ix.psi.save(f); sz = ix.bytes();
+        printf("BWT(E) %s, Psi_E %s, rank lists %s\n", mb(ix.bwt.bytes()).c_str(), mb(ix.psi.bytes()).c_str(), mb(e.bytes(false)).c_str());
+    }
     if (kind == "bihuff") {             // index of the reversed encoding, for forward search
         RLHuffRank rev; rev.build(Lrev, e.kE);
         fwrite("REVBWT01", 1, 8, f); rev.save(f);
@@ -499,10 +537,13 @@ static int do_count(int argc, char** argv) {
     char mg[8];
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
     Encoding e;
-    e.load(f);
-    if (!memcmp(mg, "PSIEX003", 8)) return count_with<RunRank, RunRank>(f, e, argv[3]);
-    if (!memcmp(mg, "PSIEF003", 8)) return count_with<EFRank, EFRank>(f, e, argv[3]);
-    if (!memcmp(mg, "PSIEH003", 8)) return count_with<RLHuffRank, EFRank>(f, e, argv[3]);
+    if (memcmp(mg, "PSIE", 4)) { fprintf(stderr, "bad index file\n"); return 1; }
+    e.load(f, mg[7] - '0');
+    char k = mg[4];
+    if (k == 'X') return count_with<RunRank, RunRank>(f, e, argv[3]);
+    if (k == 'F') return count_with<EFRank, EFRank>(f, e, argv[3]);
+    if (k == 'H') return count_with<RLHuffRank, EFRank>(f, e, argv[3]);
+    if (k == 'C') return count_with<EscRank, EFRank>(f, e, argv[3]);
     fprintf(stderr, "bad index file\n");
     return 1;
 }
@@ -591,7 +632,7 @@ struct EncBackend {
     static constexpr bool exact = false;
     EncBackend(const PsiEIndex<RB, RP>& ix_, const RB* rev_) : ix(ix_), e(*ix_.enc), rev(rev_) {}
     int64_t id_of(uint64_t raw) const { return e.id_of(raw); }
-    uint32_t pair_sym(uint32_t a, uint32_t b) const { return e.succ_rank(a, b); }   // R for (a, b), 0 if absent
+    uint32_t pair_sym(uint32_t a, uint32_t b) const { return e.encode(a, b); }   // R for (a, b), 0 if known absent
     void init(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
     void finit(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
     inline bool step(uint32_t c, uint64_t& l, uint64_t& r) const {
@@ -980,7 +1021,7 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
     }
     fclose(f);
     printf("hybrid index: %s (%s)\n", mb(ix.bytes() + (have_rev ? rev.bytes() : 0)).c_str(),
-           have_rev ? "with BWT of the reversed encoding" : "backward only");
+           have_rev ? "with BWT of the reversed encoding" : "no reversed BWT; forward search via reverse complements with --rc parses");
     EncBackend<RB, RP> be(ix, have_rev ? &rev : nullptr);
     return mems_queries(be, have_rev, argc, argv);
 }
@@ -1009,10 +1050,13 @@ static int do_mems(int argc, char** argv) {
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
     if (!memcmp(mg, "RLCSA002", 8)) return mems_plain(f, argc, argv);
     Encoding e;
-    e.load(f);
-    if (!memcmp(mg, "PSIEX003", 8)) return mems_with<RunRank, RunRank>(f, e, argc, argv);
-    if (!memcmp(mg, "PSIEF003", 8)) return mems_with<EFRank, EFRank>(f, e, argc, argv);
-    if (!memcmp(mg, "PSIEH003", 8)) return mems_with<RLHuffRank, EFRank>(f, e, argc, argv);
+    if (memcmp(mg, "PSIE", 4)) { fprintf(stderr, "bad index file\n"); return 1; }
+    e.load(f, mg[7] - '0');
+    char k = mg[4];
+    if (k == 'X') return mems_with<RunRank, RunRank>(f, e, argc, argv);
+    if (k == 'F') return mems_with<EFRank, EFRank>(f, e, argc, argv);
+    if (k == 'H') return mems_with<RLHuffRank, EFRank>(f, e, argc, argv);
+    if (k == 'C') return mems_with<EscRank, EFRank>(f, e, argc, argv);
     fprintf(stderr, "bad index file\n");
     return 1;
 }
@@ -1030,7 +1074,11 @@ static int do_bench(int argc, char** argv) {
     int width = argc > 3 ? atoi(argv[3]) : 4;
     size_t Q = argc > 4 ? atoll(argv[4]) : 100000;
     vector<size_t> ms;
-    for (int a = 5; a < argc; ++a) ms.push_back(atoll(argv[a]));
+    vector<uint32_t> caps;              // cap=N arguments: also benchmark hybrids with capped rank lists
+    for (int a = 5; a < argc; ++a) {
+        if (!strncmp(argv[a], "cap=", 4)) caps.push_back((uint32_t)atoi(argv[a] + 4));
+        else ms.push_back(atoll(argv[a]));
+    }
     if (ms.empty()) ms = {1, 2, 4, 8, 16, 32, 64};
 
     auto raw = read_ints(argv[2], width);
@@ -1061,6 +1109,30 @@ static int do_bench(int argc, char** argv) {
     uint64_t psiEF = pF->psi.bytes(), bwtEF = pF->bwt.bytes(), bwtH = pH->bwt.bytes(), bwtR = pR->bwt.bytes();
     vector<uint32_t>().swap(L); vector<uint32_t>().swap(P);
 
+    vector<shared_ptr<Encoding>> encs;
+    vector<string> capinfo;
+    for (uint32_t cap : caps) {
+        auto ec = make_shared<Encoding>();
+        ec->vals = e.vals; ec->consecutive = e.consecutive; ec->vals_base = e.vals_base; ec->sigma = e.sigma;
+        ec->cap = cap;
+        fprintf(stderr, "building capped hybrids, cap = %u\n", cap);
+        vector<uint32_t> Lc, Pc;
+        ec->prepare(T, Lc, Pc, true);
+        auto cR = make_shared<PsiEIndex<EscRank, EFRank>>(); cR->build(*ec, Lc, Pc);
+        auto cF = make_shared<PsiEIndex<EFRank>>();          cF->build(*ec, Lc, Pc);
+        uint64_t nesc = 0; for (auto x : Lc) nesc += x > cap;
+        char buf[512];
+        snprintf(buf, sizeof buf, "cap %u: runs BWT(E) = %llu, Psi_E = %llu; escapes %.2f%%; BWT(E) RL-HuffWT+escapes %s "
+                 "(escapes %s), EF %s; Psi_E %s; rank lists %s",
+                 cap, (unsigned long long)count_runs(Lc), (unsigned long long)count_runs(Pc), 100.0 * nesc / max<size_t>(n0, 1),
+                 mb(cR->bwt.bytes()).c_str(), mb(cR->bwt.has_sub ? cR->bwt.sub.bytes() : 0).c_str(), mb(cF->bwt.bytes()).c_str(),
+                 mb(cR->psi.bytes()).c_str(), mb(ec->bytes(false)).c_str());
+        capinfo.push_back(buf);
+        rows.push_back({"PsiE cap " + to_string(cap) + ": RL-HuffWT+esc", cR->bytes(), [cR](auto& p) { return cR->count_ids(p); }});
+        rows.push_back({"PsiE cap " + to_string(cap) + ": EF", cF->bytes(), [cF](auto& p) { return cF->count_ids(p); }});
+        encs.push_back(ec);
+    }
+
     fprintf(stderr, "building baselines\n");
     vector<uint32_t> LT; vector<uint64_t> CT;
     bwt_of_T(T, e.sigma, LT, CT);
@@ -1084,7 +1156,8 @@ static int do_bench(int argc, char** argv) {
            dE, dEr, dT, dTr);
     printf("BWT(E) alone: explicit %s, EF %s, HuffWT %s, RL-HuffWT %s; Psi_E (EF) %s; rankings %s\n",
            mb(pX->bwt.bytes()).c_str(), mb(bwtEF).c_str(), mb(bwtH).c_str(), mb(bwtR).c_str(),
-           mb(psiEF).c_str(), mb(e.bytes()).c_str());
+           mb(psiEF).c_str(), mb(e.bytes(false)).c_str());
+    for (auto& x : capinfo) printf("%s\n", x.c_str());
 
     mt19937_64 rng(12345);
     if (n0 <= 5000000) {
