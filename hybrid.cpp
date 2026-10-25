@@ -632,6 +632,7 @@ struct EncBackend {
     static constexpr bool exact = false;
     EncBackend(const PsiEIndex<RB, RP>& ix_, const RB* rev_) : ix(ix_), e(*ix_.enc), rev(rev_) {}
     int64_t id_of(uint64_t raw) const { return e.id_of(raw); }
+    string tag() const { return e.cap ? ".cap" + to_string(e.cap) : string(); }
     uint32_t pair_sym(uint32_t a, uint32_t b) const { return e.encode(a, b); }   // R for (a, b), 0 if known absent
     void init(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
     void finit(uint32_t, uint64_t& l, uint64_t& r) const { l = 0; r = e.n0; }
@@ -659,6 +660,7 @@ struct PlainBackend {
     static constexpr bool exact = true;
     PlainBackend(const PlainIndex& ix_, const RLFM<EFRank>* rev_) : ix(ix_), rev(rev_) {}
     int64_t id_of(uint64_t raw) const { return ix.map.id_of(raw); }
+    string tag() const { return ".rlcsa"; }
     uint32_t pair_sym(uint32_t a, uint32_t) const { return a; }
     void init(uint32_t q, uint64_t& l, uint64_t& r) const { ix.fwd.range(q, l, r); }
     void finit(uint32_t q, uint64_t& l, uint64_t& r) const { rev->range(q, l, r); }
@@ -974,7 +976,7 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
             if (en - bg >= minlen) pm.push_back({bg, en, 0, t, q.last[t] ? t : t + 1, true});
         }
         sort(pm.begin(), pm.end(), [](const PM& x, const PM& y) { return x.b != y.b ? x.b < y.b : x.e < y.e; });
-        string ofn = qfn + (BE::exact ? ".rlcsa" : use_psi ? "" : ".nopsi") + (minlen ? ".L" + to_string(minlen) : string()) +
+        string ofn = qfn + be.tag() + (BE::exact || use_psi ? "" : ".nopsi") + (minlen ? ".L" + to_string(minlen) : string()) +
                      (one_way && (have_rev || sym) ? ".oneway" : "") + ".pmems.tsv";
         FILE* fo = fopen(ofn.c_str(), "w");
         if (!fo) { perror(ofn.c_str()); return 1; }
