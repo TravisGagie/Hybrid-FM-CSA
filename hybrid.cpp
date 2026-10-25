@@ -406,11 +406,11 @@ static uint64_t count_runs(const vector<uint32_t>& s) {
 
 // ---------------------------------------------------------------- modes
 static int do_build(int argc, char** argv) {
-    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff|rlcsa]\n"); return 1; }
+    if (argc < 4) { fprintf(stderr, "usage: hybrid build <input> <index> [width] [huff|ef|explicit|bihuff|rlcsa|birlcsa]\n"); return 1; }
     int width = argc > 4 ? atoi(argv[4]) : 4;
     string kind = argc > 5 ? argv[5] : "huff";
-    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa") {
-        fprintf(stderr, "kind must be explicit, ef, huff, bihuff or rlcsa\n"); return 1;
+    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa" && kind != "birlcsa") {
+        fprintf(stderr, "kind must be explicit, ef, huff, bihuff, rlcsa or birlcsa\n"); return 1;
     }
     auto t0 = clk::now();
     auto raw = read_ints(argv[2], width);
@@ -419,14 +419,14 @@ static int do_build(int argc, char** argv) {
     e.sigma = e.vals.size();
     e.compress_vals();
     vector<uint64_t>().swap(raw);
-    if (kind == "rlcsa") {              // RLCSAs (Elias-Fano run lists) of T and of T reversed
+    if (kind == "rlcsa" || kind == "birlcsa") {   // RLCSA (Elias-Fano run lists) of T, and of T reversed with birlcsa
         FILE* f = fopen(argv[3], "wb");
         if (!f) { perror(argv[3]); return 1; }
-        fwrite("RLCSA001", 1, 8, f);
-        uint8_t c = e.consecutive;
-        fwrite(&e.sigma, 4, 1, f); fwrite(&c, 1, 1, f); fwrite(&e.vals_base, 8, 1, f);
+        fwrite("RLCSA002", 1, 8, f);
+        uint8_t c = e.consecutive, hr = kind == "birlcsa";
+        fwrite(&e.sigma, 4, 1, f); fwrite(&c, 1, 1, f); fwrite(&e.vals_base, 8, 1, f); fwrite(&hr, 1, 1, f);
         RunRank::wv(f, e.vals);
-        uint64_t sz = e.vals.size() * 8, rf, rr;
+        uint64_t sz = e.vals.size() * 8, rf, rr = 0;
         {
             vector<uint32_t> LT; vector<uint64_t> CT;
             bwt_of_T(T, e.sigma, LT, CT);
@@ -434,14 +434,15 @@ static int do_build(int argc, char** argv) {
             RLFM<EFRank> fm; fm.build(LT, CT, e.sigma); fm.save(f); sz += fm.bytes();
             printf("RLCSA of T: %llu runs, %s\n", (unsigned long long)rf, mb(fm.bytes()).c_str());
         }
+        if (hr) {
         reverse(T.begin(), T.end());
-        {
             vector<uint32_t> LT; vector<uint64_t> CT;
             bwt_of_T(T, e.sigma, LT, CT);
             rr = count_runs(LT);
             RLFM<EFRank> fm; fm.build(LT, CT, e.sigma); fm.save(f); sz += fm.bytes();
             printf("RLCSA of T reversed: %llu runs, %s\n", (unsigned long long)rr, mb(fm.bytes()).c_str());
         }
+        (void)rr;
         fclose(f);
         printf("n = %zu, sigma = %u; rlcsa index: %s, built in %.2fs\n", T.size() + 1, e.sigma, mb(sz).c_str(), secs(t0));
         return 0;
@@ -530,7 +531,8 @@ struct QueryParse {
     int k = 0, overlap = 0;
     uint64_t L = 0;
     vector<uint64_t> raw, start;        // phrase ids as written by syncparse (0xFFFFFFFF = absent)
-    vector<uint64_t> segend;            // per phrase: end of its segment
+    vector<uint64_t> segend, segbeg;    // per phrase: end and start of its segment
+    vector<uint64_t> rcraw;             // overlap = 2 (strand-symmetric parse): id of each phrase's reverse complement
     vector<uint8_t> first, last;        // first / last phrase of its segment
     uint64_t nruns = 0, nbases = 0;     // N runs and their total length
 };
@@ -552,9 +554,14 @@ static QueryParse read_qenc(const char* fn) {
         nr.resize(2 * q.nruns);
         if (q.nruns && fread(nr.data(), 8, nr.size(), f) != nr.size()) { fprintf(stderr, "%s is truncated\n", fn); exit(1); }
         for (uint64_t r = 0; r < q.nruns; ++r) q.nbases += nr[2 * r + 1] - nr[2 * r];
+        if (q.overlap == 2) {
+            vector<uint32_t> rc(np);
+            if (np && fread(rc.data(), 4, np, f) != np) { fprintf(stderr, "%s is truncated\n", fn); exit(1); }
+            q.rcraw.assign(rc.begin(), rc.end());
+        }
     }
     fclose(f);
-    q.raw.resize(np); q.start.resize(np); q.segend.resize(np); q.first.resize(np); q.last.resize(np);
+    q.raw.resize(np); q.start.resize(np); q.segend.resize(np); q.segbeg.resize(np); q.first.resize(np); q.last.resize(np);
     size_t r = 0;
     for (uint64_t t = 0; t < np; ++t) {
         q.raw[t] = rec[4 * t]; q.start[t] = rec[4 * t + 3];
@@ -563,6 +570,7 @@ static QueryParse read_qenc(const char* fn) {
         q.last[t] = t + 1 == np || (v3 && (fl & 2));
         while (r < q.nruns && nr[2 * r] <= q.start[t]) ++r;
         q.segend[t] = r < q.nruns ? nr[2 * r] : q.L;
+        q.segbeg[t] = r > 0 ? nr[2 * r - 1] : 0;
     }
     return q;
 }
@@ -627,6 +635,12 @@ struct MemFinder {
     // never occurs, or t starts a segment); F[t]: forward step from t-1 to t.
     // Hybrid: both are the rank of Q[t] after Q[t-1].  Plain: R[t] = Q[t-1], F[t] = Q[t].
     vector<uint32_t> R, F;
+    // Strand-symmetric mode: the index holds the dataset and its reverse complements,
+    // so extending Q[p..j] to the right is a backward step for rc(Q[p..j]) in the same
+    // index.  rcQ[t] = dense id of rc(Q[t]); F[t] then steps from rc(Q[p..t-1]) to
+    // rc(Q[p..t]), and a forward match can be checked with Psi_E like a backward one.
+    bool rcmode = false;
+    vector<uint32_t> rcQ;
     uint64_t steps = 0, fsteps = 0, checks = 0;   // backward steps, forward steps, rank queries on Psi_E
     static constexpr uint64_t CHECK_EVERY = 16;
     bool use_psi = true;                // false: encoded matches count as matches (no Psi_E)
@@ -636,7 +650,13 @@ struct MemFinder {
     // encoding.  Every occurrence is an e-occurrence; Q[a..b] occurs if moreover some
     // e-occurrence is preceded by Q[a] (one rank query on Psi_E).  With the plain
     // backend e-occurrence is occurrence.
-    MemFinder(const BE& be_, const QueryParse& q, bool have_rev) : be(be_), rev(have_rev) {
+    // (Without Psi_E, matching is relaxed differently in the two directions -- pairs of
+    // consecutive phrases forward, pairs of their reverse complements backward -- and
+    // the two relaxations cannot be mixed; so strand-symmetric forward search is used
+    // only with Psi_E, or with the exact plain backend.)
+    MemFinder(const BE& be_, const QueryParse& q, bool fwd_ok, bool have_rev, bool psi = true)
+        : be(be_), rev(have_rev && fwd_ok) {
+        use_psi = psi;
         uint64_t np = q.raw.size();
         Q.assign(np, 0); R.assign(np, 0); F.assign(np, 0);
         for (uint64_t t = 0; t < np; ++t) {
@@ -644,10 +664,22 @@ struct MemFinder {
             int64_t id = be.id_of(q.raw[t]);
             Q[t] = id < 0 ? 0 : (uint32_t)id;
         }
-        for (uint64_t t = 1; t < np; ++t) if (Q[t - 1] && Q[t] && !q.first[t]) {
-            if (BE::exact) { R[t] = Q[t - 1]; F[t] = Q[t]; }
-            else R[t] = F[t] = be.pair_sym(Q[t - 1], Q[t]);
+        rcmode = q.overlap == 2 && fwd_ok && (BE::exact || use_psi);
+        if (rcmode) {
+            rcQ.assign(np, 0);
+            for (uint64_t t = 0; t < np; ++t) if (Q[t] && q.rcraw[t] != 0xFFFFFFFFu) {
+                int64_t id = be.id_of(q.rcraw[t]);
+                rcQ[t] = id < 0 ? 0 : (uint32_t)id;
+            }
+            for (uint64_t t = 0; t < np; ++t) if (!rcQ[t]) Q[t] = 0;   // (cannot happen with a symmetric parse)
         }
+        for (uint64_t t = 1; t < np; ++t) if (Q[t - 1] && Q[t] && !q.first[t]) {
+            if (BE::exact) R[t] = Q[t - 1];
+            else R[t] = be.pair_sym(Q[t - 1], Q[t]);
+            if (rcmode) F[t] = BE::exact ? rcQ[t] : be.pair_sym(rcQ[t], rcQ[t - 1]);
+            else F[t] = BE::exact ? Q[t] : R[t];
+        }
+        if (rcmode) rev = true;             // forward search is always available
         if (BE::exact) use_psi = false;
     }
     inline bool step(uint32_t c, uint64_t& l, uint64_t& r) { ++steps; return be.step(c, l, r); }
@@ -692,15 +724,43 @@ struct MemFinder {
         }
         return hi;
     }
-    // largest j <= cap such that Q[p..j] e-occurs, by forward search (Q[p] present)
-    uint64_t forward_extend(uint64_t p, uint64_t cap) {
+    // largest j <= cap such that Q[p..j] occurs (truth) or e-occurs, by forward search
+    // (Q[p] present).  In strand-symmetric mode the intervals are those of rc(Q[p..j])
+    // in the same index, and Q[j] is checked with Psi_E (as rc(Q[j]) is the first phrase
+    // of rc(Q[p..j])), every CHECK_EVERY steps and then by binary search.
+    uint64_t forward_extend(uint64_t p, uint64_t cap, bool truth = false) {
         uint64_t j = p, l, r;
-        be.finit(Q[p], l, r);
-        while (j < cap && F[j + 1] && fstep(F[j + 1], l, r)) ++j;
-        return j;
+        if (!rcmode) {
+            be.finit(Q[p], l, r);
+            while (j < cap && F[j + 1] && fstep(F[j + 1], l, r)) ++j;
+            return j;
+        }
+        be.init(rcQ[p], l, r);
+        vector<pair<uint64_t, uint64_t>> ivl{{l, r}};      // ivl[d]: interval of rc(Q[p..p+d])
+        uint64_t good = p;
+        bool bad = false;
+        while (j < cap && F[j + 1]) {
+            if (!fstep_same(F[j + 1], l, r)) break;
+            ++j;
+            ivl.push_back({l, r});
+            if (truth && (j - p) % CHECK_EVERY == 0) {
+                if (precedes(rcQ[j], l, r, true)) good = j; else { bad = true; break; }
+            }
+        }
+        if (!truth) return j;
+        if (!bad && j > good) { auto [ll, rr] = ivl[j - p]; if (precedes(rcQ[j], ll, rr, true)) return j; }
+        uint64_t lo = good, hi = bad ? j : j;   // largest x in [good, hi) that occurs; good occurs
+        while (hi - lo > 1) {
+            uint64_t mid = (lo + hi) >> 1;
+            auto [ll, rr] = ivl[mid - p];
+            if (precedes(rcQ[mid], ll, rr, true)) lo = mid; else hi = mid;
+        }
+        return lo;
     }
+    inline bool fstep_same(uint32_t c, uint64_t& l, uint64_t& r) { ++fsteps; return be.step(c, l, r); }
     // largest j' in [p, cap] such that Q[p..j'] occurs (truth) or e-occurs
     uint64_t right_end(uint64_t p, uint64_t cap, bool truth) {
+        if (rcmode) return forward_extend(p, cap, truth);
         if (rev && !truth) return forward_extend(p, cap);
         uint64_t lo = p, hi = cap + 1;          // Q[p..lo] occurs; Q[p..hi] does not (or hi = cap + 1)
         uint64_t d = 1;
@@ -750,7 +810,7 @@ struct MemFinder {
     vector<pair<uint64_t, uint64_t>> mems() {
         vector<pair<uint64_t, uint64_t>> out;
         if (Q.empty()) return out;
-        if (!rev) { mems_range(0, Q.size() - 1, use_psi, out); tidy(out); return out; }
+        if (!rev || rcmode) { mems_range(0, Q.size() - 1, use_psi, out); tidy(out); return out; }
         vector<pair<uint64_t, uint64_t>> em;
         vector<bool> et;
         mems_range(0, Q.size() - 1, false, em, use_psi ? &et : nullptr);   // e-MEMs by forward-backward
@@ -772,7 +832,7 @@ struct MemFinder {
     vector<pair<uint64_t, uint64_t>> long_mems(uint64_t L, Ext ext) {
         vector<pair<uint64_t, uint64_t>> out;
         uint64_t np = Q.size();
-        bool wtruth = !rev && use_psi;          // what windows are tested for
+        bool wtruth = (!rev || rcmode) && use_psi;   // what windows are tested for
         uint64_t a = 0, b = 0;
         while (a < np) {
             if (b < a) b = a;
@@ -783,7 +843,7 @@ struct MemFinder {
             if (s > a) { a = s; continue; }
             uint64_t j = right_end(a, np - 1, wtruth);
             uint64_t i = longest_suffix(j, 0, wtruth);
-            if (rev && use_psi) {
+            if (rev && use_psi && !rcmode) {
                 vector<pair<uint64_t, uint64_t>> in;
                 if (i == j || precedes(Q[i], last_l, last_r, true)) in.push_back({i, j});
                 else mems_range(i, j, true, in);
@@ -813,17 +873,35 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
     for (auto& qfn : qfiles) {
         QueryParse q = read_qenc(qfn.c_str());
         auto t0 = clk::now();
-        MemFinder<BE> mf(be, q, have_rev && !one_way);
-        if (!BE::exact) mf.use_psi = use_psi;
+        MemFinder<BE> mf(be, q, !one_way, have_rev, BE::exact || use_psi);
         bool exact = BE::exact || use_psi;      // reported parse MEMs are true parse MEMs
         uint64_t np = q.raw.size();
+        // Pseudo-MEM bounds.  overlap = 0: a boundary depends on the k characters from it
+        // on, so a parse MEM Q[i..j] is extended by one phrase to the left and by one phrase
+        // plus k characters to the right.  overlap = 2 (strand-symmetric): phrases run from
+        // one syncmer centre to the next, inclusive, and a boundary depends on h = (k-1)/2
+        // characters on each side, so the extension is one phrase plus h characters on
+        // each side.  (overlap = 1: one phrase, plus the k characters shared, to the right.)
+        bool sym = q.overlap == 2;
+        uint64_t h = sym ? (uint64_t)(q.k - 1) / 2 : 0;
         auto pstart = [&](uint64_t t) { return q.start[t]; };
-        auto pend = [&](uint64_t t) { return q.last[t] ? q.segend[t] : q.start[t + 1]; };   // non-overlapping end
+        auto pend = [&](uint64_t t) -> uint64_t {      // end (exclusive) of phrase t
+            if (q.last[t]) return q.segend[t];
+            return q.start[t + 1] + (sym ? 1 : 0);
+        };
         uint64_t ext = (uint64_t)q.k;    // extra characters past the end of the extension phrase
+        auto left_of = [&](uint64_t t) -> uint64_t {   // start of phrase t minus the margin
+            return q.first[t] ? q.start[t] : max<uint64_t>(q.segbeg[t], q.start[t] >= h ? q.start[t] - h : 0);
+        };
         // the pseudo-MEM of Q[i..j], clipped to the segment
-        auto pm_begin = [&](uint64_t i) { return pstart(q.first[i] ? i : i - 1); };
+        auto pm_begin = [&](uint64_t i) -> uint64_t {
+            if (q.first[i]) return pstart(i);
+            return sym ? left_of(i - 1) : pstart(i - 1);
+        };
         auto pm_end = [&](uint64_t j) -> uint64_t {
-            if (q.last[j] || q.last[j + 1]) return q.segend[j];
+            if (q.last[j]) return q.segend[j];
+            if (sym) return min<uint64_t>(q.segend[j], pend(j + 1) + h);
+            if (q.last[j + 1]) return q.segend[j];
             if (q.overlap) return min<uint64_t>(q.segend[j], q.start[j + 2] + ext);
             return min<uint64_t>(q.segend[j], pend(j + 1) + ext);
         };
@@ -834,7 +912,7 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
         vector<PM> pm;
         for (auto [i, j] : ms) {
             uint64_t b = pm_begin(i), en = pm_end(j);
-            uint64_t lb = (q.overlap ? (q.last[j] ? q.segend[j] : min<uint64_t>(q.segend[j], q.start[j + 1] + ext)) : pend(j)) - pstart(i);
+            uint64_t lb = (q.overlap == 1 ? (q.last[j] ? q.segend[j] : min<uint64_t>(q.segend[j], q.start[j + 1] + ext)) : pend(j)) - pstart(i);
             if (!exact) {               // only single phrases and pairs of consecutive phrases are known to occur
                 lb = pend(i) - pstart(i);
                 for (uint64_t t = i + 1; t <= j; ++t) lb = max<uint64_t>(lb, pend(t) - pstart(t - 1));
@@ -848,13 +926,15 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
                 if (!q.first[t]) continue;
                 en = q.segend[t];
             } else if (!mf.Q[t + 1]) {
-                en = q.last[t + 1] ? q.segend[t] : min<uint64_t>(q.segend[t], q.overlap ? q.start[t + 2] + ext : pend(t + 1) + ext);
+                if (sym) en = q.last[t + 1] ? q.segend[t] : min<uint64_t>(q.segend[t], pend(t + 1) + h);
+                else en = q.last[t + 1] ? q.segend[t] : min<uint64_t>(q.segend[t], q.overlap ? q.start[t + 2] + ext : pend(t + 1) + ext);
             } else continue;
-            if (en - pstart(t) >= minlen) pm.push_back({pstart(t), en, 0, t, q.last[t] ? t : t + 1, true});
+            uint64_t bg = sym ? left_of(t) : pstart(t);
+            if (en - bg >= minlen) pm.push_back({bg, en, 0, t, q.last[t] ? t : t + 1, true});
         }
         sort(pm.begin(), pm.end(), [](const PM& x, const PM& y) { return x.b != y.b ? x.b < y.b : x.e < y.e; });
         string ofn = qfn + (BE::exact ? ".rlcsa" : use_psi ? "" : ".nopsi") + (minlen ? ".L" + to_string(minlen) : string()) +
-                     (have_rev && one_way ? ".oneway" : "") + ".pmems.tsv";
+                     (one_way && (have_rev || sym) ? ".oneway" : "") + ".pmems.tsv";
         FILE* fo = fopen(ofn.c_str(), "w");
         if (!fo) { perror(ofn.c_str()); return 1; }
         fprintf(fo, "start\tend\tlength\tlower_bound\tfirst_phrase\tlast_phrase\tkind\n");
@@ -907,15 +987,18 @@ static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
 static int mems_plain(FILE* f, int argc, char** argv) {
     PlainIndex ix;
     uint8_t c;
-    if (fread(&ix.map.sigma, 4, 1, f) != 1 || fread(&c, 1, 1, f) != 1 || fread(&ix.map.vals_base, 8, 1, f) != 1) exit(1);
+    uint8_t hr;
+    if (fread(&ix.map.sigma, 4, 1, f) != 1 || fread(&c, 1, 1, f) != 1 || fread(&ix.map.vals_base, 8, 1, f) != 1 ||
+        fread(&hr, 1, 1, f) != 1) exit(1);
     ix.map.consecutive = c;
     RunRank::rv(f, ix.map.vals);
     ix.fwd.load(f);
-    ix.rev.load(f); ix.have_rev = true;
+    if (hr) { ix.rev.load(f); ix.have_rev = true; }
     fclose(f);
-    printf("RLCSA index: %s (forward %s, reversed %s)\n", mb(ix.bytes()).c_str(), mb(ix.fwd.bytes()).c_str(), mb(ix.rev.bytes()).c_str());
-    PlainBackend be(ix, &ix.rev);
-    return mems_queries(be, true, argc, argv);
+    if (hr) printf("RLCSA index: %s (forward %s, reversed %s)\n", mb(ix.bytes()).c_str(), mb(ix.fwd.bytes()).c_str(), mb(ix.rev.bytes()).c_str());
+    else printf("RLCSA index: %s\n", mb(ix.bytes()).c_str());
+    PlainBackend be(ix, hr ? &ix.rev : nullptr);
+    return mems_queries(be, hr, argc, argv);
 }
 
 static int do_mems(int argc, char** argv) {
@@ -924,7 +1007,7 @@ static int do_mems(int argc, char** argv) {
     if (!f) { perror(argv[2]); return 1; }
     char mg[8];
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
-    if (!memcmp(mg, "RLCSA001", 8)) return mems_plain(f, argc, argv);
+    if (!memcmp(mg, "RLCSA002", 8)) return mems_plain(f, argc, argv);
     Encoding e;
     e.load(f);
     if (!memcmp(mg, "PSIEX003", 8)) return mems_with<RunRank, RunRank>(f, e, argc, argv);
