@@ -36,6 +36,9 @@
 #include "runrank.hpp"
 #include "efrank.hpp"
 #include "huffwt.hpp"
+#include "gaprank.hpp"
+using EscRank = EscRankT<RLHuffRank, EFRank>;     // run-length: for repetitive inputs
+using EscRankP = EscRankT<HuffWT, GapRank>;       // plain: for inputs with few long runs
 #include <functional>
 #include "libsais.h"
 #include <chrono>
@@ -350,7 +353,7 @@ struct PsiEIndex {
 
     void build(const Encoding& e, const vector<uint32_t>& L, const vector<uint32_t>& P) {
         enc = &e;
-        if constexpr (std::is_same_v<RB, EscRank>) bwt.cap = e.cap;
+        if constexpr (std::is_same_v<RB, EscRank> || std::is_same_v<RB, EscRankP>) bwt.cap = e.cap;
         bwt.build(L, e.kE);
         psi.build(P, e.sigma + 1);
     }
@@ -1102,12 +1105,15 @@ static int do_bench(int argc, char** argv) {
     auto pF = make_shared<PsiEIndex<EFRank>>();               pF->build(e, L, P);
     auto pH = make_shared<PsiEIndex<HuffWT, EFRank>>();       pH->build(e, L, P);
     auto pR = make_shared<PsiEIndex<RLHuffRank, EFRank>>();   pR->build(e, L, P);
+    auto pG = make_shared<PsiEIndex<HuffWT, GapRank>>();      pG->build(e, L, P);
     fprintf(stderr, "  rank structures (%.2fs)\n", secs(t0));
     double dE = pH->bwt.avg_depth(), dEr = pR->bwt.heads.avg_depth();
     rows.push_back({"PsiE: BWT(E) explicit", pX->bytes(), [pX](auto& p) { return pX->count_ids(p); }});
     rows.push_back({"PsiE: BWT(E) EF", pF->bytes(), [pF](auto& p) { return pF->count_ids(p); }});
     rows.push_back({"PsiE: BWT(E) HuffWT", pH->bytes(), [pH](auto& p) { return pH->count_ids(p); }});
     rows.push_back({"PsiE: BWT(E) RL-HuffWT", pR->bytes(), [pR](auto& p) { return pR->count_ids(p); }});
+    rows.push_back({"PsiE: HuffWT, gap Psi_E", pG->bytes(), [pG](auto& p) { return pG->count_ids(p); }});
+    uint64_t psiGap = pG->psi.bytes();
     uint64_t psiEF = pF->psi.bytes(), bwtEF = pF->bwt.bytes(), bwtH = pH->bwt.bytes(), bwtR = pR->bwt.bytes();
     vector<uint32_t>().swap(L); vector<uint32_t>().swap(P);
 
@@ -1122,6 +1128,7 @@ static int do_bench(int argc, char** argv) {
         ec->prepare(T, Lc, Pc, true);
         auto cR = make_shared<PsiEIndex<EscRank, EFRank>>(); cR->build(*ec, Lc, Pc);
         auto cF = make_shared<PsiEIndex<EFRank>>();          cF->build(*ec, Lc, Pc);
+        auto cP = make_shared<PsiEIndex<EscRankP, GapRank>>(); cP->build(*ec, Lc, Pc);
         uint64_t nesc = 0; for (auto x : Lc) nesc += x > cap;
         char buf[512];
         snprintf(buf, sizeof buf, "cap %u: runs BWT(E) = %llu, Psi_E = %llu; escapes %.2f%%; BWT(E) RL-HuffWT+escapes %s "
@@ -1129,9 +1136,13 @@ static int do_bench(int argc, char** argv) {
                  cap, (unsigned long long)count_runs(Lc), (unsigned long long)count_runs(Pc), 100.0 * nesc / max<size_t>(n0, 1),
                  mb(cR->bwt.bytes()).c_str(), mb(cR->bwt.has_sub ? cR->bwt.sub.bytes() : 0).c_str(), mb(cF->bwt.bytes()).c_str(),
                  mb(cR->psi.bytes()).c_str(), mb(ec->bytes(false)).c_str());
+        capinfo.push_back(string(buf));
+        snprintf(buf, sizeof buf, "cap %u, plain: BWT(E) HuffWT+escapes %s (escapes %s), Psi_E gap-coded %s",
+                 cap, mb(cP->bwt.bytes()).c_str(), mb(cP->bwt.has_sub ? cP->bwt.sub.bytes() : 0).c_str(), mb(cP->psi.bytes()).c_str());
         capinfo.push_back(buf);
         rows.push_back({"PsiE cap " + to_string(cap) + ": RL-HuffWT+esc", cR->bytes(), [cR](auto& p) { return cR->count_ids(p); }});
         rows.push_back({"PsiE cap " + to_string(cap) + ": EF", cF->bytes(), [cF](auto& p) { return cF->count_ids(p); }});
+        rows.push_back({"PsiE cap " + to_string(cap) + ": HuffWT+esc, gap", cP->bytes(), [cP](auto& p) { return cP->count_ids(p); }});
         encs.push_back(ec);
     }
 
@@ -1143,11 +1154,13 @@ static int do_bench(int argc, char** argv) {
     auto fF = make_shared<RLFM<EFRank>>();     fF->build(LT, CT, e.sigma);
     auto fH = make_shared<RLFM<HuffWT>>();     fH->build(LT, CT, e.sigma);
     auto fR = make_shared<RLFM<RLHuffRank>>(); fR->build(LT, CT, e.sigma);
+    auto fG = make_shared<RLFM<GapRank>>();    fG->build(LT, CT, e.sigma);
     double dT = fH->bwt.avg_depth(), dTr = fR->bwt.heads.avg_depth();
     rows.push_back({"FM(T): explicit", fX->bytes(), [fX](auto& p) { return fX->count_ids(p); }});
     rows.push_back({"FM(T): EF", fF->bytes(), [fF](auto& p) { return fF->count_ids(p); }});
     rows.push_back({"FM(T): HuffWT", fH->bytes(), [fH](auto& p) { return fH->count_ids(p); }});
     rows.push_back({"FM(T): RL-HuffWT", fR->bytes(), [fR](auto& p) { return fR->count_ids(p); }});
+    rows.push_back({"CSA(T): gap Psi", fG->bytes(), [fG](auto& p) { return fG->count_ids(p); }});
     vector<uint32_t>().swap(LT);
 
     printf("n = %zu, sigma = %u, H0(T) = %.2f bits, E alphabet = %u, distinct bigrams = %zu\n",
@@ -1159,6 +1172,7 @@ static int do_bench(int argc, char** argv) {
     printf("BWT(E) alone: explicit %s, EF %s, HuffWT %s, RL-HuffWT %s; Psi_E (EF) %s; rankings %s\n",
            mb(pX->bwt.bytes()).c_str(), mb(bwtEF).c_str(), mb(bwtH).c_str(), mb(bwtR).c_str(),
            mb(psiEF).c_str(), mb(e.bytes(false)).c_str());
+    printf("Psi_E gap-coded (plain, no runs) %s\n", mb(psiGap).c_str());
     for (auto& x : capinfo) printf("%s\n", x.c_str());
 
     mt19937_64 rng(12345);
