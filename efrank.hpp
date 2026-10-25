@@ -47,6 +47,7 @@ struct EliasFano {
     std::vector<uint64_t> low, high;
     uint64_t hbits = 0;
     std::vector<uint64_t> s0, s1;       // positions of every SAMPLE-th zero / one
+    std::vector<uint64_t> ones;         // ones before each 512-bit block of high
     static constexpr uint64_t SAMPLE = 256;
 
     void build(const std::vector<uint64_t>& v, uint64_t universe) {
@@ -64,6 +65,12 @@ struct EliasFano {
             high[p >> 6] |= 1ull << (p & 63);
         }
         s0.clear(); s1.clear();
+        ones.assign(hbits / 512 + 2, 0);
+        for (uint64_t b = 1; b < ones.size(); ++b) {
+            uint64_t c = 0;
+            for (uint64_t w = (b - 1) * 8; w < b * 8 && w < high.size(); ++w) c += __builtin_popcountll(high[w]);
+            ones[b] = ones[b - 1] + c;
+        }
         uint64_t c0 = 0, c1 = 0;
         for (uint64_t p = 0; p < hbits; ++p) {
             if ((high[p >> 6] >> (p & 63)) & 1) { if (c1 % SAMPLE == 0) s1.push_back(p); ++c1; }
@@ -84,28 +91,30 @@ struct EliasFano {
     }
     inline bool hbit(uint64_t p) const { return (high[p >> 6] >> (p & 63)) & 1; }
 
-    inline uint64_t select1(uint64_t k) const {        // position of k-th one (0-based)
-        uint64_t p = s1[k / SAMPLE];
-        uint64_t rem = k % SAMPLE;
-        uint64_t w = p >> 6;
-        uint64_t word = high[w] & (~0ull << (p & 63));
-        for (;;) {
+    // Selects: the samples give a range of 512-bit blocks, a binary search over the
+    // rank directory finds the block, and a scan of at most 8 words finishes.  (A
+    // plain scan from the sample can be very long where the values are clustered.)
+    template <bool ONE>
+    inline uint64_t select_(uint64_t k) const {
+        const std::vector<uint64_t>& smp = ONE ? s1 : s0;
+        uint64_t i = k / SAMPLE;
+        uint64_t lo = smp[i] >> 9;
+        uint64_t hi = (i + 1 < smp.size()) ? (smp[i + 1] >> 9) + 1 : ones.size() - 1;
+        auto before = [&](uint64_t blk) { return ONE ? ones[blk] : (blk << 9) - ones[blk]; };
+        while (hi - lo > 1) {                     // last block in [lo, hi) with before(block) <= k
+            uint64_t mid = (lo + hi) >> 1;
+            if (before(mid) <= k) lo = mid; else hi = mid;
+        }
+        uint64_t rem = k - before(lo);
+        for (uint64_t w = lo * 8;; ++w) {
+            uint64_t word = ONE ? high[w] : ~high[w];
             uint64_t c = __builtin_popcountll(word);
             if (rem < c) return (w << 6) + select_in_word(word, rem);
-            rem -= c; word = high[++w];
+            rem -= c;
         }
     }
-    inline uint64_t select0(uint64_t k) const {        // position of k-th zero (0-based)
-        uint64_t p = s0[k / SAMPLE];
-        uint64_t rem = k % SAMPLE;
-        uint64_t w = p >> 6;
-        uint64_t word = ~high[w] & (~0ull << (p & 63));
-        for (;;) {
-            uint64_t c = __builtin_popcountll(word);
-            if (rem < c) return (w << 6) + select_in_word(word, rem);
-            rem -= c; word = ~high[++w];
-        }
-    }
+    inline uint64_t select1(uint64_t k) const { return select_<true>(k); }   // position of k-th one (0-based)
+    inline uint64_t select0(uint64_t k) const { return select_<false>(k); }  // position of k-th zero (0-based)
     inline uint64_t access(uint64_t j) const {
         return ((select1(j) - j) << l) | get_low(j);
     }
@@ -117,17 +126,24 @@ struct EliasFano {
         while (!hbit(q)) ++q;
         b = ((q - j - 1) << l) | get_low(j + 1);
     }
-    // number of elements < x; also returns the high-bit position of the last one (if any)
+    // number of elements < x
     inline uint64_t count_less(uint64_t x) const {
         if (x >= u) return n;
         uint64_t h = x >> l, xl = x & ((1ull << l) - 1);
-        uint64_t idx, pos;
-        if (h == 0) { idx = 0; pos = 0; }
-        else { uint64_t p = select0(h - 1); idx = p - (h - 1); pos = p + 1; }
-        while (pos < hbits && hbit(pos) && get_low(idx) < xl) { ++idx; ++pos; }
-        return idx;
+        // the elements whose high part is h are those with indices in [lo, hi)
+        uint64_t lo = (h == 0) ? 0 : select0(h - 1) - (h - 1);
+        uint64_t hi = select0(h) - h;
+        if (hi - lo <= 8) {
+            while (lo < hi && get_low(lo) < xl) ++lo;
+            return lo;
+        }
+        while (lo < hi) {                   // a bucket can be large if the values are clustered
+            uint64_t mid = (lo + hi) >> 1;
+            if (get_low(mid) < xl) lo = mid + 1; else hi = mid;
+        }
+        return lo;
     }
-    uint64_t bytes() const { return (low.size() + high.size() + s0.size() + s1.size()) * 8 + 40; }
+    uint64_t bytes() const { return (low.size() + high.size() + s0.size() + s1.size() + ones.size()) * 8 + 40; }
 
     template <class V> static void wv(FILE* f, const V& v) {
         uint64_t k = v.size(); fwrite(&k, 8, 1, f); if (k) fwrite(v.data(), sizeof(v[0]), k, f);
@@ -138,12 +154,12 @@ struct EliasFano {
     }
     void save(FILE* f) const {
         fwrite(&n, 8, 1, f); fwrite(&u, 8, 1, f); fwrite(&l, 4, 1, f); fwrite(&hbits, 8, 1, f);
-        wv(f, low); wv(f, high); wv(f, s0); wv(f, s1);
+        wv(f, low); wv(f, high); wv(f, s0); wv(f, s1); wv(f, ones);
     }
     void load(FILE* f) {
         if (fread(&n, 8, 1, f) != 1 || fread(&u, 8, 1, f) != 1 || fread(&l, 4, 1, f) != 1 ||
             fread(&hbits, 8, 1, f) != 1) throw std::runtime_error("read");
-        rv(f, low); rv(f, high); rv(f, s0); rv(f, s1);
+        rv(f, low); rv(f, high); rv(f, s0); rv(f, s1); rv(f, ones);
     }
 };
 
