@@ -37,6 +37,7 @@
 #include "efrank.hpp"
 #include "huffwt.hpp"
 #include "gaprank.hpp"
+#include "blockidx.hpp"
 using EscRank = EscRankT<RLHuffRank, EFRank>;     // run-length: for repetitive inputs
 using EscRankP = EscRankT<HuffWT, GapRank>;       // plain: for inputs with few long runs
 #include <functional>
@@ -439,8 +440,8 @@ static int do_build(int argc, char** argv) {
     string kind = argc > 5 ? argv[5] : "huff";
     uint32_t cap = argc > 6 ? (uint32_t)atoi(argv[6]) : 0;
     if (cap && kind != "huff" && kind != "ef") { fprintf(stderr, "a cap needs kind huff or ef\n"); return 1; }
-    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa" && kind != "birlcsa") {
-        fprintf(stderr, "kind must be explicit, ef, huff, bihuff, rlcsa or birlcsa\n"); return 1;
+    if (kind != "explicit" && kind != "ef" && kind != "huff" && kind != "bihuff" && kind != "rlcsa" && kind != "birlcsa" && kind != "blocks" && kind != "biblocks") {
+        fprintf(stderr, "kind must be explicit, ef, huff, bihuff, rlcsa, birlcsa, blocks or biblocks\n"); return 1;
     }
     auto t0 = clk::now();
     auto raw = read_ints(argv[2], width);
@@ -450,6 +451,30 @@ static int do_build(int argc, char** argv) {
     e.sigma = e.vals.size();
     e.compress_vals();
     vector<uint64_t>().swap(raw);
+    if (kind == "blocks" || kind == "biblocks") {   // block indexes of T (and of T reversed)
+        FILE* f = fopen(argv[3], "wb");
+        if (!f) { perror(argv[3]); return 1; }
+        fwrite("BLKIDX01", 1, 8, f);
+        uint8_t c = e.consecutive, hf = kind == "biblocks";
+        fwrite(&e.sigma, 4, 1, f); fwrite(&c, 1, 1, f); fwrite(&e.vals_base, 8, 1, f); fwrite(&hf, 1, 1, f);
+        RunRank::wv(f, e.vals);
+        uint32_t sep = (e.consecutive ? e.vals_base == 0 : (!e.vals.empty() && e.vals[0] == 0)) ? 1 : 0;
+        uint64_t sz = e.vals.size() * 8;
+        {
+            BlockIndex bw; bw.build(T, e.sigma, sep, true); bw.save(f); sz += bw.bytes();
+            printf("block index of T: %llu blocks (%.2f phrases per block), %llu block symbols, %s\n",
+                   (unsigned long long)bw.nb, (double)bw.n / max<uint64_t>(bw.nb, 1), (unsigned long long)bw.nsym, mb(bw.bytes()).c_str());
+        }
+        if (hf) {
+            reverse(T.begin(), T.end());
+            BlockIndex fw; fw.build(T, e.sigma, sep, true); fw.save(f); sz += fw.bytes();
+            printf("block index of T reversed: %llu blocks (%.2f phrases per block), %llu block symbols, %s\n",
+                   (unsigned long long)fw.nb, (double)fw.n / max<uint64_t>(fw.nb, 1), (unsigned long long)fw.nsym, mb(fw.bytes()).c_str());
+        }
+        fclose(f);
+        printf("%s index: %s, built in %.2fs\n", kind.c_str(), mb(sz).c_str(), secs(t0));
+        return 0;
+    }
     if (kind == "rlcsa" || kind == "birlcsa") {   // RLCSA (Elias-Fano run lists) of T, and of T reversed with birlcsa
         FILE* f = fopen(argv[3], "wb");
         if (!f) { perror(argv[3]); return 1; }
@@ -904,7 +929,8 @@ struct MemFinder {
     }
 };
 
-template <class BE>
+template <class BE> struct MemFinder;
+template <class BE, class MF = MemFinder<BE>>
 static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
     bool use_psi = true, one_way = false;
     uint64_t minlen = 0;                // -L: only pseudo-MEMs of at least this many characters
@@ -919,7 +945,7 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
     for (auto& qfn : qfiles) {
         QueryParse q = read_qenc(qfn.c_str());
         auto t0 = clk::now();
-        MemFinder<BE> mf(be, q, !one_way, have_rev, BE::exact || use_psi);
+        MF mf(be, q, !one_way, have_rev, BE::exact || use_psi);
         bool exact = BE::exact || use_psi;      // reported parse MEMs are true parse MEMs
         uint64_t np = q.raw.size();
         // Pseudo-MEM bounds.  overlap = 0: a boundary depends on the k characters from it
@@ -1013,6 +1039,122 @@ static int mems_queries(const BE& be, bool have_rev, int argc, char** argv) {
     return 0;
 }
 
+// ---------------------------------------------------------------- block index MEMs
+struct BlockPair {
+    Encoding map;                       // map from input values to dense ids
+    BlockIndex bw;                      // on T: backward search
+    BlockIndex fw;                      // on T reversed: forward search
+    bool have_fw = false;
+    uint64_t bytes() const { return map.vals.size() * 8 + bw.bytes() + (have_fw ? fw.bytes() : 0); }
+};
+struct BlockBackend {
+    BlockPair* ix;
+    static constexpr bool exact = true;
+    int64_t id_of(uint64_t raw) const { return ix->map.id_of(raw); }
+    string tag() const { return ".blocks"; }
+};
+// The MEM algorithms of MemFinder over the block indexes: longest suffix by backward search
+// on bw, right extension by backward search on fw over the reversed query.
+struct BlockFinder {
+    BlockPair& ix;
+    bool rev = false;
+    bool use_psi = false;
+    vector<uint32_t> Q, Qr;
+    vector<uint8_t> hs, cut, hsr, cutr;
+    uint64_t np = 0;
+    uint64_t steps = 0, fsteps = 0, checks = 0;
+    BlockFinder(const BlockBackend& be, const QueryParse& q, bool fwd_ok, bool, bool) : ix(*be.ix) {
+        np = q.raw.size();
+        rev = fwd_ok && ix.have_fw;
+        Q.assign(np, 0);
+        for (uint64_t t = 0; t < np; ++t) if (q.raw[t] != 0xFFFFFFFFu) { int64_t id = be.id_of(q.raw[t]); Q[t] = id < 0 ? 0 : (uint32_t)id; }
+        hs.assign(np, 0); cut.assign(np, 0);
+        for (uint64_t t = 0; t < np; ++t) {
+            cut[t] = q.first[t];
+            if (t && !q.first[t] && Q[t] && Q[t - 1] && Q[t] == ix.bw.top[Q[t - 1]]) hs[t] = 1;
+        }
+        if (rev) {
+            Qr.assign(np, 0); hsr.assign(np, 0); cutr.assign(np, 0);
+            for (uint64_t t = 0; t < np; ++t) { Qr[t] = Q[np - 1 - t]; cutr[t] = q.last[np - 1 - t]; }
+            for (uint64_t t = 1; t < np; ++t)
+                if (!cutr[t] && Qr[t] && Qr[t - 1] && Qr[t] == ix.fw.top[Qr[t - 1]]) hsr[t] = 1;
+        }
+    }
+    void collect() {
+        steps = ix.bw.steps + ix.bw.hsteps; fsteps = ix.fw.steps + ix.fw.hsteps; checks = ix.bw.hchecks + ix.fw.hchecks;
+    }
+    uint64_t longest_suffix(uint64_t j, uint64_t floor) { return ix.bw.longest_suffix(Q, hs, cut, j, floor); }
+    bool occurs(uint64_t a, uint64_t b) { return Q[a] && longest_suffix(b, a) == a; }
+    uint64_t right_end(uint64_t p, uint64_t cap) {     // largest j <= cap with Q[p..j] occurring
+        if (rev) return np - 1 - ix.fw.longest_suffix(Qr, hsr, cutr, np - 1 - p, np - 1 - cap);
+        uint64_t lo = p, hi = cap + 1, d = 1;
+        while (lo + d < hi && occurs(p, lo + d)) { lo += d; d *= 2; }
+        if (lo + d < hi) hi = lo + d;
+        while (hi - lo > 1) { uint64_t mid = (lo + hi) >> 1; if (occurs(p, mid)) lo = mid; else hi = mid; }
+        return lo;
+    }
+    void mems_range(uint64_t lo, uint64_t hi, vector<pair<uint64_t, uint64_t>>& out) {
+        int64_t j = (int64_t)hi;
+        while (j >= (int64_t)lo && !Q[j]) --j;
+        while (j >= (int64_t)lo) {
+            uint64_t i = longest_suffix((uint64_t)j, lo);
+            out.push_back({i, (uint64_t)j});
+            if (i == lo) break;
+            uint64_t p = i - 1;
+            if (!Q[p] || cut[i]) {
+                j = (int64_t)p;
+                while (j >= (int64_t)lo && !Q[j]) --j;
+                continue;
+            }
+            j = (int64_t)right_end(p, (uint64_t)j - 1);
+        }
+    }
+    vector<pair<uint64_t, uint64_t>> mems() {
+        vector<pair<uint64_t, uint64_t>> out;
+        if (np) mems_range(0, np - 1, out);
+        MemFinder<PlainBackend>::tidy(out);
+        collect();
+        return out;
+    }
+    template <class Ext>
+    vector<pair<uint64_t, uint64_t>> long_mems(uint64_t L, Ext ext) {
+        vector<pair<uint64_t, uint64_t>> out;
+        uint64_t a = 0, b = 0;
+        while (a < np) {
+            if (b < a) b = a;
+            while (b < np && ext(a, b) < L) ++b;
+            if (b == np) break;
+            if (!Q[b]) { a = b + 1; continue; }
+            uint64_t s = longest_suffix(b, a);
+            if (s > a) { a = s; continue; }
+            uint64_t j = right_end(a, np - 1);
+            uint64_t i = longest_suffix(j, 0);
+            out.push_back({i, j});
+            if (j + 1 >= np) break;
+            if (!Q[j + 1]) { a = j + 2; continue; }
+            a = max<uint64_t>(i + 1, longest_suffix(j + 1, i + 1));
+        }
+        MemFinder<PlainBackend>::tidy(out);
+        collect();
+        return out;
+    }
+};
+static int mems_blocks(FILE* f, int argc, char** argv) {
+    static BlockPair ix;
+    uint8_t c, hf;
+    if (fread(&ix.map.sigma, 4, 1, f) != 1 || fread(&c, 1, 1, f) != 1 || fread(&ix.map.vals_base, 8, 1, f) != 1 ||
+        fread(&hf, 1, 1, f) != 1) exit(1);
+    ix.map.consecutive = c;
+    RunRank::rv(f, ix.map.vals);
+    ix.bw.load(f);
+    if (hf) { ix.fw.load(f); ix.have_fw = true; }
+    fclose(f);
+    printf("block index: %s (backward %s%s)\n", mb(ix.bytes()).c_str(), mb(ix.bw.bytes()).c_str(),
+           hf ? (", forward " + mb(ix.fw.bytes())).c_str() : "");
+    BlockBackend be{&ix};
+    return mems_queries<BlockBackend, BlockFinder>(be, ix.have_fw, argc, argv);
+}
+
 template <class RB, class RP>
 static int mems_with(FILE* f, const Encoding& e, int argc, char** argv) {
     PsiEIndex<RB, RP> ix;
@@ -1054,6 +1196,7 @@ static int do_mems(int argc, char** argv) {
     char mg[8];
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
     if (!memcmp(mg, "RLCSA002", 8)) return mems_plain(f, argc, argv);
+    if (!memcmp(mg, "BLKIDX01", 8)) return mems_blocks(f, argc, argv);
     Encoding e;
     if (memcmp(mg, "PSIE", 4)) { fprintf(stderr, "bad index file\n"); return 1; }
     e.load(f, mg[7] - '0');
@@ -1331,6 +1474,64 @@ static int do_blocks(int argc, char** argv) {
     return 0;
 }
 
+
+// blockbench: counting with the block index against the RLCSA of T, on random substrings of T
+static int do_blockbench(int argc, char** argv) {
+    if (argc < 3) { fprintf(stderr, "usage: hybrid blockbench <input> [width] [queries] [m ...]\n"); return 1; }
+    int width = argc > 3 ? atoi(argv[3]) : 4;
+    size_t Q = argc > 4 ? atoll(argv[4]) : 20000;
+    vector<size_t> ms;
+    for (int a = 5; a < argc; ++a) ms.push_back(atoll(argv[a]));
+    if (ms.empty()) ms = {2, 4, 8, 16, 32, 64};
+    auto raw = read_ints(argv[2], width);
+    vector<uint64_t> vals;
+    auto T = densify(raw, vals);
+    vector<uint64_t>().swap(raw);
+    uint32_t sigma = vals.size();
+    uint32_t sep = (!vals.empty() && vals[0] == 0) ? 1 : 0;
+    auto t0 = clk::now();
+    BlockIndex bi; bi.build(T, sigma, sep, true);
+    double tb = secs(t0);
+    t0 = clk::now();
+    RLFM<EFRank> fm;
+    {
+        vector<uint32_t> LT; vector<uint64_t> CT;
+        bwt_of_T(T, sigma, LT, CT);
+        fm.build(LT, CT, sigma);
+    }
+    double tr = secs(t0);
+    printf("n = %zu, sigma = %u; blocks %llu (%.2f phrases per block), block symbols %llu\n", T.size(), sigma,
+           (unsigned long long)bi.nb, (double)bi.n / max<uint64_t>(bi.nb, 1), (unsigned long long)bi.nsym);
+    printf("block index %s (block BWT %s, hash bits %s, H %s, s %s, block symbols %s), built in %.1fs\n",
+           mb(bi.bytes()).c_str(), mb(bi.bbwt.bytes()).c_str(), mb(bi.hashbit.bytes()).c_str(), mb(bi.H.bytes()).c_str(),
+           mb(bi.top.size() * 4).c_str(), mb(bi.jv.size() * 2 + bi.dstart.bytes()).c_str(), tb);
+    printf("RLCSA of T %s, built in %.1fs\n", mb(fm.bytes()).c_str(), tr);
+    mt19937_64 rng(12345);
+    printf("count time, microseconds per query (%zu random substrings of T per m); block steps and hash steps per query\n", Q);
+    printf("%6s %12s %12s %10s %10s %8s\n", "m", "RLCSA", "blocks", "bsteps", "hsteps", "agree");
+    for (size_t m : ms) {
+        vector<vector<uint32_t>> pats;
+        while (pats.size() < Q) {
+            size_t st = rng() % (T.size() - m + 1);
+            bool ok = true;
+            for (size_t k = 0; k < m && ok; ++k) ok = T[st + k] != sep;
+            if (ok) pats.emplace_back(T.begin() + st, T.begin() + st + m);
+        }
+        vector<uint64_t> a(Q), b(Q);
+        auto t1 = clk::now();
+        for (size_t q = 0; q < Q; ++q) a[q] = fm.count_ids(pats[q]);
+        double ta = secs(t1) / Q * 1e6;
+        bi.steps = bi.hsteps = bi.hchecks = 0;
+        t1 = clk::now();
+        for (size_t q = 0; q < Q; ++q) b[q] = bi.count(pats[q]);
+        double tbq = secs(t1) / Q * 1e6;
+        size_t agree = 0; for (size_t q = 0; q < Q; ++q) agree += a[q] == b[q];
+        printf("%6zu %12.3f %12.3f %10.2f %10.2f %7zu/%zu\n", m, ta, tbq, (double)bi.steps / Q, (double)bi.hsteps / Q, agree, Q);
+        fflush(stdout);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: hybrid build|count|bench|mems ...\n"); return 1; }
     string mode = argv[1];
@@ -1339,6 +1540,7 @@ int main(int argc, char** argv) {
     if (mode == "bench") return do_bench(argc, argv);
     if (mode == "mems") return do_mems(argc, argv);
     if (mode == "blocks") return do_blocks(argc, argv);
+    if (mode == "blockbench") return do_blockbench(argc, argv);
     fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 1;
 }
