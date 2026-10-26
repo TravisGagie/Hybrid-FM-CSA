@@ -1373,8 +1373,10 @@ static int do_bench(int argc, char** argv) {
 // with #, the character that # stands for, in suffix order; Psi_E lists T[p-1] for every
 // suffix.  Reports run counts and how many steps searches would take.
 static int do_blocks(int argc, char** argv) {
-    if (argc < 3) { fprintf(stderr, "usage: hybrid blocks <input> [width]\n"); return 1; }
-    int width = argc > 3 ? atoi(argv[3]) : 4;
+    if (argc < 3) { fprintf(stderr, "usage: hybrid blocks <input> [width] [--min]\n"); return 1; }
+    int width = argc > 3 && argv[3][0] != '-' ? atoi(argv[3]) : 4;
+    bool use_min = false;                 // --min: s(x) = the smallest successor (lexicographic order with --lex ids)
+    for (int a = 3; a < argc; ++a) if (!strcmp(argv[a], "--min")) use_min = true;
     auto t0 = clk::now();
     auto raw = read_ints(argv[2], width);
     vector<uint64_t> vals;
@@ -1393,7 +1395,8 @@ static int do_blocks(int argc, char** argv) {
         for (size_t i = 0; i < pr.size();) {
             size_t j = i; while (j < pr.size() && pr[j] == pr[i]) ++j;
             uint32_t a = pr[i] >> 32, b = (uint32_t)pr[i];
-            if (top[a] == 0 || j - i > best) { if (top[a] == 0 || (j - i) > best) { top[a] = b; best = j - i; } }
+            if (use_min) { if (top[a] == 0) top[a] = b; }      // pairs are sorted, so the first b is the smallest
+            else if (top[a] == 0 || j - i > best) { top[a] = b; best = j - i; }
             i = j;
             if (i < pr.size() && (pr[i] >> 32) != a) best = 0;
         }
@@ -1423,6 +1426,7 @@ static int do_blocks(int argc, char** argv) {
     vector<uint32_t> B(nb);
     for (size_t i = 0; i < nb; ++i) B[i] = (uint32_t)(lower_bound(u.begin(), u.end(), ord[i]) - u.begin()) + 1;
     vector<uint64_t>().swap(ord); vector<uint64_t>().swap(bkey);
+    printf("s = %s successor\n", use_min ? "smallest" : "most frequent");
     printf("n = %llu phrases, sigma = %u; hashes %.2f%%; blocks %llu (%.2f%% of n, %.2f phrases per block); "
            "distinct block symbols %llu; longest run of hashes %llu\n",
            (unsigned long long)n, sigma, 100.0 * nh / max<uint64_t>(n, 1), (unsigned long long)nb, 100.0 * nb / max<uint64_t>(n, 1),
