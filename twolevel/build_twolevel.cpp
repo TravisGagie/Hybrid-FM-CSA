@@ -18,98 +18,140 @@
 #include "text.hpp"
 #include "twolevel.hpp"
 
+#ifndef TL_CHUNK
+#define TL_CHUNK (1 << 24)
+#endif
+
 using namespace tl;
 using Clock = std::chrono::steady_clock;
 
 static double secs(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
-// The text T = S_1 # ... # S_k # $ of a collection file with one sequence per
-// line, as rs::read_text builds it (empty lines skipped, CR dropped), but read
-// in one piece so that the memory is not doubled while it grows.
-static std::vector<uint8_t> read_collection(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("cannot open " + path);
-    fseek(f, 0, SEEK_END);
-    long long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::vector<uint8_t> X((size_t)sz + 2);
-    if (sz > 0 && fread(X.data(), 1, (size_t)sz, f) != (size_t)sz) throw std::runtime_error("cannot read " + path);
-    fclose(f);
-    if (sz > 0 && X[0] == '>') throw std::runtime_error(path + ": FASTA is not supported; use one sequence per line");
-    size_t w = 0;
-    bool in_line = false;
-    for (size_t i = 0; i < (size_t)sz; ++i) {
-        uint8_t c = X[i];
-        if (c == '\r') continue;
-        if (c == '\n') { if (in_line) X[w++] = rs::kSeparator; in_line = false; continue; }
-        if (c == rs::kSeparator || c == rs::kTerminator) throw std::runtime_error(path + " contains a byte 0x00 or 0x01");
-        X[w++] = c; in_line = true;
+// The characters of T = S_1 # ... # S_k # $ (or, reversed, of
+// T' = rev(S_k) # ... # rev(S_1) # $) for a collection file with one sequence per
+// line, as rs::read_text builds them (empty lines skipped, CR dropped), in
+// pieces, so that the text is never held in memory.
+struct TextStream {
+    FILE* f = nullptr;
+    bool rev = false, done = false, in_line = false, finished = false;
+    long long pos = 0, size = 0;              // reversed: bytes [0, pos) not yet read
+    std::vector<uint8_t> raw;
+    TextStream(const std::string& path, bool reversed) : rev(reversed) {
+        f = fopen(path.c_str(), "rb");
+        if (!f) throw std::runtime_error("cannot open " + path);
+        fseeko(f, 0, SEEK_END); size = ftello(f); fseeko(f, 0, SEEK_SET);
+        int c = fgetc(f);
+        if (c == '>') throw std::runtime_error(path + ": FASTA is not supported; use one sequence per line");
+        fseeko(f, 0, SEEK_SET);
+        pos = rev ? size : 0;
+        raw.resize(TL_CHUNK);
     }
-    if (in_line) X[w++] = rs::kSeparator;
-    X[w++] = rs::kTerminator;
-    X.resize(w);
-    X.shrink_to_fit();
-    return X;
-}
+    ~TextStream() { if (f) fclose(f); }
+    void emit(uint8_t c, std::vector<uint8_t>& out) {
+        if (c == '\r') return;
+        if (c == '\n') { if (in_line) out.push_back(rs::kSeparator); in_line = false; return; }
+        if (c == rs::kSeparator || c == rs::kTerminator) throw std::runtime_error("the collection contains a byte 0x00 or 0x01");
+        out.push_back(c); in_line = true;
+    }
+    // Appends at least one character to out, or returns false at the end.
+    bool read(std::vector<uint8_t>& out) {
+        if (finished) return false;
+        size_t before = out.size();
+        while (out.size() == before) {
+            size_t got;
+            if (!rev) {
+                got = fread(raw.data(), 1, raw.size(), f);
+                for (size_t i = 0; i < got; ++i) emit(raw[i], out);
+            } else {
+                long long want = std::min<long long>((long long)raw.size(), pos);
+                pos -= want;
+                fseeko(f, pos, SEEK_SET);
+                got = want ? fread(raw.data(), 1, (size_t)want, f) : 0;
+                if ((long long)got != want) throw std::runtime_error("read error");
+                // reading backwards, a newline ends the line that follows it
+                for (size_t i = got; i-- > 0;) emit(raw[i], out);
+            }
+            if (got == 0) {
+                if (in_line) out.push_back(rs::kSeparator);
+                out.push_back(rs::kTerminator);
+                finished = true;
+                break;
+            }
+        }
+        return true;
+    }
+};
 
 // Builds the levels of one direction.  hf[id] and hr[id] are the hashes of
 // phrase id and of its reverse, for joining the two directions' dictionaries.
+// The text is streamed: only the distinct phrases and the parse are kept.
 static void build_level(const std::string& text_path, bool reversed, const std::string& rlbwt_path, Level& L,
                         std::vector<uint64_t>& hf, std::vector<uint64_t>& hr, Clock::time_point t0) {
-    std::vector<uint8_t> X = read_collection(text_path);
-    if (reversed) {   // S_1 # ... # S_k # $  ->  rev(S_k) # ... # rev(S_1) # $
-        std::reverse(X.begin(), X.end() - 1);
-        std::rotate(X.begin(), X.begin() + 1, X.end() - 1);
-    }
-    const uint64_t n = X.size();
-    std::cerr << "text: " << n << " characters (" << secs(t0) << " s)\n";
-
-    // boundaries
-    std::vector<uint64_t> b;
-    bool zero_is_syncmer = false;
-    for_each_syncmer(X.data(), n, [&](uint64_t q) { if (q == 0) zero_is_syncmer = true; b.push_back(q); });
-    if (!zero_is_syncmer) b.insert(b.begin(), 0);
-    const uint64_t m = b.size();
-    if (m + 1 >= (1ull << 31)) throw std::runtime_error("too many phrases for a 32-bit parse suffix array");
-    auto plen = [&](uint64_t i) -> uint64_t { return i + 1 < m ? b[i + 1] + K - b[i] : n - b[i]; };
-    std::cerr << "boundaries: " << m << " (" << secs(t0) << " s)\n";
-
-    // distinct phrases
-    std::vector<uint32_t> pz(m);
-    std::vector<uint32_t> rep;        // first occurrence (phrase index) of each distinct phrase
+    std::vector<uint32_t> pz;             // the parse, as indices of distinct phrases (later, ids)
+    std::vector<uint8_t> dict;            // the distinct phrases, concatenated
+    std::vector<uint64_t> doff;           // start of each in dict (one extra entry at the end)
     std::vector<uint64_t> rhash;
+    std::unordered_map<uint64_t, uint32_t> seen;
+    bool zero_is_syncmer = false;
+    uint64_t n = 0;
     {
-        std::unordered_map<uint64_t, uint32_t> seen;
-        seen.reserve(m / 8);
-        for (uint64_t i = 0; i < m; ++i) {
-            uint64_t len = plen(i);
-            uint64_t hv = phrase_hash(X.data() + b[i], len);
+        TextStream ts(text_path, reversed);
+        std::vector<uint8_t> buf;         // X[base .. base + buf.size())
+        uint64_t base = 0, open = 0, scanned = 0;   // open: start of the unfinished phrase; scanned: k-mer starts evaluated
+        auto add_phrase = [&](uint64_t s, uint64_t e) {
+            const uint8_t* p = buf.data() + (s - base);
+            uint64_t len = e - s, hv = phrase_hash(p, len);
             auto it = seen.find(hv);
             if (it == seen.end()) {
-                seen.emplace(hv, (uint32_t)rep.size());
-                pz[i] = (uint32_t)rep.size();
-                rep.push_back((uint32_t)i); rhash.push_back(hv);
+                uint32_t idx = (uint32_t)rhash.size();
+                seen.emplace(hv, idx);
+                rhash.push_back(hv);
+                doff.push_back(dict.size());
+                dict.insert(dict.end(), p, p + len);
+                pz.push_back(idx);
             } else {
-                uint32_t r0 = rep[it->second];
-                if (plen(r0) != len || std::memcmp(X.data() + b[r0], X.data() + b[i], len))
-                    throw std::runtime_error("phrase hash collision; change phrase_hash");
-                pz[i] = it->second;
+                uint32_t idx = it->second;
+                uint64_t a = doff[idx], b2 = idx + 1 < doff.size() ? doff[idx + 1] : dict.size();
+                if (b2 - a != len || std::memcmp(dict.data() + a, p, len)) throw std::runtime_error("phrase hash collision; change phrase_hash");
+                pz.push_back(idx);
             }
+        };
+        bool more = true;
+        while (more) {
+            more = ts.read(buf);
+            const uint64_t end = base + buf.size();
+            if (end >= (uint64_t)K && end - K + 1 > scanned) {
+                const uint64_t from = scanned;
+                for_each_syncmer(buf.data() + (from - base), end - from, [&](uint64_t q) {
+                    uint64_t a = from + q;
+                    if (a == 0) { zero_is_syncmer = true; return; }
+                    add_phrase(open, a + K);
+                    open = a;
+                });
+                scanned = end - K + 1;
+            }
+            if (!more) { n = end; add_phrase(open, n); break; }
+            uint64_t keep = std::min(open, scanned);
+            if (keep > base) { buf.erase(buf.begin(), buf.begin() + (keep - base)); base = keep; }
         }
     }
-    const uint32_t sigma = (uint32_t)rep.size();
-    std::cerr << "distinct phrases: " << sigma << " (" << secs(t0) << " s)\n";
+    doff.push_back(dict.size());
+    seen = std::unordered_map<uint64_t, uint32_t>();
+    const uint64_t m = pz.size();
+    if (m + 1 >= (1ull << 31)) throw std::runtime_error("too many phrases for a 32-bit parse suffix array");
+    const uint32_t sigma = (uint32_t)rhash.size();
+    auto ptr = [&](uint32_t a) { return dict.data() + doff[a]; };
+    auto dlen = [&](uint32_t a) { return doff[a + 1] - doff[a]; };
+    std::cerr << "text: " << n << " characters; " << m << " phrases, " << sigma << " distinct (" << dict.size() / 1e6
+              << " MB) (" << secs(t0) << " s)\n";
 
     // lexicographic ids 1..sigma (byte order; the dictionary is prefix-free)
     std::vector<uint32_t> order(sigma);
     for (uint32_t a = 0; a < sigma; ++a) order[a] = a;
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t c) {
-        uint64_t la = plen(rep[a]), lc = plen(rep[c]);
-        int r = std::memcmp(X.data() + b[rep[a]], X.data() + b[rep[c]], std::min(la, lc));
-        if (r == 0 && la != lc) {
-            // a proper prefix: cannot happen if the dictionary is prefix-free
-            throw std::runtime_error("dictionary is not prefix-free");
-        }
+        uint64_t la = dlen(a), lc = dlen(c);
+        int r = std::memcmp(ptr(a), ptr(c), std::min(la, lc));
+        if (r == 0 && la != lc) throw std::runtime_error("dictionary is not prefix-free");
         return r < 0;
     });
     std::vector<uint32_t> idof(sigma);
@@ -118,38 +160,30 @@ static void build_level(const std::string& text_path, bool reversed, const std::
     L.n = n; L.m = m; L.sigma = sigma;
     hf.assign(sigma + 1, 0); hr.assign(sigma + 1, 0);
     {
-        std::vector<uint8_t> buf;
+        std::vector<uint8_t> tmp;
         for (uint32_t a = 0; a < sigma; ++a) {
-            uint64_t len = plen(rep[a]);
-            const uint8_t* p = X.data() + b[rep[a]];
-            buf.assign(p, p + len);
-            std::reverse(buf.begin(), buf.end());
+            tmp.assign(ptr(a), ptr(a) + dlen(a));
+            std::reverse(tmp.begin(), tmp.end());
             hf[idof[a]] = rhash[a];
-            hr[idof[a]] = phrase_hash(buf.data(), len);
+            hr[idof[a]] = phrase_hash(tmp.data(), tmp.size());
         }
     }
     std::cerr << "sorted (" << secs(t0) << " s)\n";
 
     // distinct syncmers: phrases with equal first K characters are adjacent in id order
-    std::vector<uint64_t> synrep;     // a text position of each distinct syncmer
+    std::vector<uint8_t> syn;
     {
         uint32_t skip = zero_is_syncmer ? 0 : pz[0];
-        int64_t prev = -1;  // position of the previous distinct syncmer
+        const uint8_t* prev = nullptr;
         for (uint32_t r = 0; r < sigma; ++r) {
-            uint32_t a = order[r];
             if (r + 1 == skip) continue;
-            uint64_t pos = b[rep[a]];
-            if (prev < 0 || std::memcmp(X.data() + prev, X.data() + pos, K)) { synrep.push_back(pos); prev = pos; }
+            const uint8_t* p = ptr(order[r]);
+            if (!prev || std::memcmp(prev, p, K)) { syn.insert(syn.end(), p, p + K); prev = p; }
         }
     }
-    const size_t nsyn = synrep.size();
-    std::vector<uint8_t> syn(nsyn * K);
-    for (size_t k = 0; k < nsyn; ++k) std::memcpy(syn.data() + k * K, X.data() + synrep[k], K);
-    std::vector<uint64_t>().swap(synrep);
-    std::vector<uint32_t>().swap(rep); std::vector<uint64_t>().swap(rhash);
+    const size_t nsyn = syn.size() / K;
     std::vector<uint32_t>().swap(order); std::vector<uint32_t>().swap(idof);
-    std::vector<uint8_t>().swap(X);
-    std::vector<uint64_t>().swap(b);
+    std::vector<uint64_t>().swap(rhash); std::vector<uint8_t>().swap(dict); std::vector<uint64_t>().swap(doff);
     std::cerr << "distinct syncmers: " << nsyn << "\n";
 
     // B: the union of the syncmers' intervals, and the row of position 0
