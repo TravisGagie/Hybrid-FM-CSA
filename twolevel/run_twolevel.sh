@@ -37,19 +37,19 @@ rm -rf "$T"; mkdir -p "$T"
 stamp "self-test passed: the same MEMs and intervals as plain search"
 
 TIME=(); if [ -x /usr/bin/time ]; then TIME=(/usr/bin/time -v); fi
-if [ ! -s "$OUT/text.lvl" ]; then
+if [ ! -s "$OUT/text_v3.lvl" ]; then
   stamp "building the levels of T"
-  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_t3/rlbwt.bin" --out "$OUT/text.lvl" 2> "$OUT/build_text.log"
+  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_t3/rlbwt.bin" --out "$OUT/text_v3.lvl" 2> "$OUT/build_text.log"
   grep -E "boundaries|distinct|B:|blocks|BWT|sizes|Maximum resident|Elapsed" "$OUT/build_text.log" || true
 fi
-if [ ! -s "$OUT/rev.lvl" ]; then
+if [ ! -s "$OUT/rev_v3.lvl" ]; then
   stamp "building the levels of the reversed collection"
-  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_rev_t3/rlbwt.bin" --out "$OUT/rev.lvl" --reversed 2> "$OUT/build_rev.log"
+  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_rev_t3/rlbwt.bin" --out "$OUT/rev_v3.lvl" --reversed 2> "$OUT/build_rev.log"
   grep -E "boundaries|distinct|B:|blocks|BWT|sizes|Maximum resident|Elapsed" "$OUT/build_rev.log" || true
 fi
 
 Q=(taskset -c "$PIN" "$B/query_twolevel" --index "$C/packed_t3" --reversed-index "$C/packed_rev_t3"
-   --level "$OUT/text.lvl" --reversed-level "$OUT/rev.lvl" --patterns "$C/queries.txt")
+   --level "$OUT/text_v3.lvl" --reversed-level "$OUT/rev_v3.lvl" --patterns "$C/queries.txt")
 if [ "$MODE" = quick ]; then
   stamp "quick run: BML, L = 1000, one round, best shortcuts (t6, ell 25)"
   "${Q[@]}" --shortcuts "ell25_theta0@$C/packed_t6@$C/packed_rev_t6" --algorithm bml --min-length 1000 --repeat 1 \

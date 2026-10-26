@@ -100,8 +100,11 @@ int main(int argc, char** argv) {
         for (auto& x : pz) x = idof[x];
         Level L;
         L.n = n; L.m = m; L.sigma = sigma;
-        L.phash.assign(sigma + 1, 0);
-        for (uint32_t a = 0; a < sigma; ++a) L.phash[idof[a]] = rhash[a];
+        {
+            std::vector<uint64_t> phash(sigma + 1, 0);
+            for (uint32_t a = 0; a < sigma; ++a) phash[idof[a]] = rhash[a];
+            L.set_dictionary(phash);
+        }
         std::cerr << "sorted (" << secs(t0) << " s)\n";
 
         // distinct syncmers: phrases with equal first K characters are adjacent in id order
@@ -163,15 +166,15 @@ int main(int argc, char** argv) {
         std::vector<uint8_t>().swap(syn);
 
         // successors and blocks
-        L.succ.assign(sigma + 1, 0);
+        std::vector<uint32_t> succ(sigma + 1, 0);
         for (uint64_t i = 0; i + 1 < m; ++i) {
-            uint32_t& s = L.succ[pz[i]];
+            uint32_t& s = succ[pz[i]];
             if (!s || pz[i + 1] < s) s = pz[i + 1];
         }
         std::vector<uint8_t> cont(m + 1, 0);
         L.ccont.assign(sigma / 64 + 1, 0);
         for (uint64_t i = 1; i < m; ++i) {
-            cont[i] = L.succ[pz[i - 1]] == pz[i];
+            cont[i] = succ[pz[i - 1]] == pz[i];
             if (cont[i]) L.ccont[pz[i] >> 6] |= 1ull << (pz[i] & 63);
         }
         // symbol of the block ending just before each block start (and m)
@@ -191,10 +194,14 @@ int main(int argc, char** argv) {
         std::sort(syms.begin(), syms.end());
         syms.erase(std::unique(syms.begin(), syms.end()), syms.end());
         L.nsym = syms.size();
-        L.dstart.assign(sigma + 2, 0);
-        L.jv.resize(syms.size());
-        for (size_t k = 0; k < syms.size(); ++k) { L.dstart[(syms[k] >> 32) + 1]++; L.jv[k] = ~(uint32_t)syms[k]; }
-        for (uint32_t d = 0; d <= sigma; ++d) L.dstart[d + 1] += L.dstart[d];
+        {
+            std::vector<uint64_t> ds(sigma + 2, 0), jvv(syms.size());
+            for (size_t k = 0; k < syms.size(); ++k) { ds[(syms[k] >> 32) + 1]++; jvv[k] = ~(uint32_t)syms[k]; }
+            for (uint32_t d = 0; d <= sigma; ++d) ds[d + 1] += ds[d];
+            L.set_symbols(ds, jvv);
+        }
+        L.set_succ(succ);
+        std::vector<uint32_t>().swap(succ);
         std::cerr << "blocks: " << L.nblocks << " (" << (double)m / L.nblocks << " phrases each), " << L.nsym << " symbols\n";
 
         // the parse BWT
@@ -237,7 +244,6 @@ int main(int argc, char** argv) {
         std::cerr << "block BWT: " << L.bbwt.nruns << " runs, " << L.bbwt.bytes() / 1e6 << " MB; BS " << L.BS.bytes() / 1e6
                   << " MB (" << secs(t0) << " s)\n";
         L.save(out_path);
-        L.build_table();
         std::cerr << "sizes (MB): B " << L.B.bytes() / 1e6 << ", parse BWT " << L.pbwt.bytes() / 1e6 << ", phrase table "
                   << L.table_bytes() / 1e6 << ", succ " << L.succ_bytes() / 1e6 << ", BS " << L.BS.bytes() / 1e6
                   << ", block BWT " << L.bbwt.bytes() / 1e6 << ", symbols " << L.sym_bytes() / 1e6 << "\n";

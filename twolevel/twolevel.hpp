@@ -64,7 +64,10 @@ inline uint64_t mix64(uint64_t x) {
 
 // Calls f(q) for each start q of a closed syncmer in x[0 .. len), in order: the
 // k-mer x[q .. q+K) is over A/C/G/T, and its smallest s-mer, by g = a hash of
-// the 2-bit code, is its first or its last (ties included).  The window minima
+// the smaller of the 2-bit codes of the s-mer and of its reverse, is its first
+// or its last (ties included).  Since g is the same for an s-mer and its
+// reverse, the syncmers of the reverse of a string are the reverses of its
+// syncmers, so a pattern and its reverse are scanned only once.  The window minima
 // are computed by the van Herk / Gil-Werman method, in chunks.
 template <class F>
 void for_each_syncmer(const uint8_t* x, uint64_t len, F f) {
@@ -84,19 +87,22 @@ void for_each_syncmer(const uint8_t* x, uint64_t len, F f) {
         const uint64_t cq = std::min(CH, nq - c0);   // k-mer starts c0 .. c0+cq-1
         const uint64_t ns = cq + W - 1;              // s-mer starts c0 .. c0+ns-1
         // g over the s-mers: 0 if the s-mer has a character other than A/C/G/T
-        uint64_t smer = 0;
+        uint64_t smer = 0, rsmer = 0;                // codes of the s-mer and of its reverse
         int64_t bad = -1;                            // last bad character, relative to c0
         for (int64_t i = 0; i < SM - 1; ++i) {
             int cc = code[x[c0 + i]];
             if (cc < 0) { bad = i; cc = 0; }
             smer = ((smer << 2) | (uint64_t)cc) & mask;
+            rsmer = (rsmer >> 2) | ((uint64_t)cc << (2 * (SM - 1)));
         }
         for (uint64_t t = 0; t < ns; ++t) {
             int64_t i = (int64_t)t + SM - 1;
             int cc = code[x[c0 + i]];
             if (cc < 0) { bad = i; cc = 0; }
             smer = ((smer << 2) | (uint64_t)cc) & mask;
-            g[t] = bad >= (int64_t)t ? 0 : (mix64(smer) >> 1) + 1;
+            rsmer = (rsmer >> 2) | ((uint64_t)cc << (2 * (SM - 1)));
+            uint64_t cm = smer < rsmer ? smer : rsmer;
+            g[t] = bad >= (int64_t)t ? 0 : (mix64(cm) >> 1) + 1;
         }
         // block prefix and suffix minima, blocks of W s-mers
         for (uint64_t b0 = 0; b0 < ns; b0 += W) {
@@ -159,6 +165,38 @@ struct RLBits {
     }
 };
 
+// Fixed-width packed integers.
+struct PackedInts {
+    uint64_t n = 0;
+    uint32_t w = 1;
+    std::vector<uint64_t> d;
+    void build(const std::vector<uint64_t>& v) {
+        n = v.size();
+        uint64_t mx = 0;
+        for (auto x : v) mx = std::max(mx, x);
+        w = 1;
+        while (w < 64 && (mx >> w)) ++w;
+        d.assign((n * w + 63) / 64 + 1, 0);
+        for (uint64_t i = 0; i < n; ++i) {
+            uint64_t bpos = i * w, x = v[i];
+            d[bpos >> 6] |= x << (bpos & 63);
+            if ((bpos & 63) + w > 64) d[(bpos >> 6) + 1] |= x >> (64 - (bpos & 63));
+        }
+    }
+    inline uint64_t get(uint64_t i) const {
+        uint64_t bpos = i * w, k = bpos >> 6, o = bpos & 63;
+        uint64_t x = d[k] >> o;
+        if (o + w > 64) x |= d[k + 1] << (64 - o);
+        return w == 64 ? x : x & ((1ull << w) - 1);
+    }
+    uint64_t bytes() const { return d.size() * 8 + 12; }
+    void save(FILE* f) const { fwrite(&n, 8, 1, f); fwrite(&w, 4, 1, f); EliasFano::wv(f, d); }
+    void load(FILE* f) {
+        if (fread(&n, 8, 1, f) != 1 || fread(&w, 4, 1, f) != 1) throw std::runtime_error("read");
+        EliasFano::rv(f, d);
+    }
+};
+
 struct Level {
     uint64_t n = 0;          // rows of the character-level BWT
     uint64_t m = 0;          // phrases; the parse has m + 1 rows
@@ -169,65 +207,94 @@ struct Level {
     EFRank pbwt;
     EliasFano BS;
     EFRank bbwt;
-    std::vector<uint32_t> succ;     // sigma + 1
-    std::vector<uint32_t> dstart;   // sigma + 2: symbols of d are dstart[d] .. dstart[d+1]-1 (0-based)
-    std::vector<uint32_t> jv;       // j of each symbol, descending within each d
-    std::vector<uint64_t> phash;    // sigma + 1: hash of phrase id (phash[0] unused)
+    PackedInts succp;               // succ(x), x = 0..sigma (0: none)
+    EliasFano dstart;               // sigma + 2 values: symbols of d are dstart[d] .. dstart[d+1]-1 (0-based)
+    PackedInts jv;                  // j of each symbol, descending within each d
     std::vector<uint64_t> ccont;    // bit x: phrase x is a continuation somewhere in the parse
-    inline bool can_continue(uint32_t x) const { return (ccont[x >> 6] >> (x & 63)) & 1; }
-    // query-time phrase table (built at load): open addressing on the hash
-    std::vector<uint64_t> tkey;
-    std::vector<uint32_t> tid;
-    uint64_t tmask = 0;
+    // Phrase dictionary for queries: the 64-bit hashes sorted, in buckets by their
+    // top hb bits; each slot stores the other 64 - hb bits (so the whole hash is
+    // checked) and the phrase id.
+    uint32_t hb = 1;
+    EliasFano hbucket;              // 2^hb + 1 values: first slot of each bucket
+    PackedInts hlow, hid;
 
+    inline uint32_t succ(uint32_t x) const { return (uint32_t)succp.get(x); }
+    inline bool can_continue(uint32_t x) const { return (ccont[x >> 6] >> (x & 63)) & 1; }
     inline uint32_t sym(uint32_t d, uint64_t j) const {
-        uint32_t a = dstart[d], b = dstart[d + 1];
+        uint64_t a0, b0;
+        dstart.access2(d, a0, b0);
+        uint64_t a = a0, b = b0;
         while (a < b) {                                 // jv descending
-            uint32_t mid = (a + b) >> 1;
-            if (jv[mid] > j) a = mid + 1; else b = mid;
+            uint64_t mid = (a + b) >> 1;
+            if (jv.get(mid) > j) a = mid + 1; else b = mid;
         }
-        return (a < dstart[d + 1] && jv[a] == j) ? a + 1 : 0;
+        return (a < b0 && jv.get(a) == j) ? (uint32_t)a + 1 : 0;
     }
     inline uint32_t lookup(uint64_t hv) const {
-        for (uint64_t p = hv & tmask;; p = (p + 1) & tmask) {
-            if (tkey[p] == hv) return tid[p];
-            if (tkey[p] == 0) return 0;
+        uint64_t bk = hv >> (64 - hb), lo = hb == 64 ? 0 : hv & ((1ull << (64 - hb)) - 1);
+        uint64_t a, b;
+        hbucket.access2(bk, a, b);
+        for (; a < b; ++a) {
+            uint64_t x = hlow.get(a);
+            if (x == lo) return (uint32_t)hid.get(a);
+            if (x > lo) return 0;
         }
+        return 0;
     }
-    void build_table() {
-        uint64_t sz = 1;
-        while (sz < 2ull * sigma + 2) sz <<= 1;
-        tkey.assign(sz, 0); tid.assign(sz, 0); tmask = sz - 1;
-        for (uint32_t id = 1; id <= sigma; ++id) {
-            uint64_t p = phash[id] & tmask;
-            while (tkey[p]) p = (p + 1) & tmask;
-            tkey[p] = phash[id]; tid[p] = id;
+
+    // From plain arrays, at build time.
+    void set_succ(const std::vector<uint32_t>& s) { succp.build(std::vector<uint64_t>(s.begin(), s.end())); }
+    void set_symbols(const std::vector<uint64_t>& ds, const std::vector<uint64_t>& j) {
+        dstart.build(ds, nsym + 1); jv.build(j);
+    }
+    void set_dictionary(const std::vector<uint64_t>& phash) {      // phash[id], id = 1..sigma
+        hb = 1;
+        while (hb < 32 && (1ull << hb) < sigma) ++hb;
+        std::vector<std::pair<uint64_t, uint32_t>> v;
+        v.reserve(sigma);
+        for (uint32_t id = 1; id <= sigma; ++id) v.push_back({phash[id], id});
+        std::sort(v.begin(), v.end());
+        for (size_t k = 1; k < v.size(); ++k)
+            if (v[k].first == v[k - 1].first) throw std::runtime_error("two phrases with the same hash");
+        uint64_t nb = 1ull << hb;
+        std::vector<uint64_t> st(nb + 1), lw(sigma), ids(sigma);
+        uint64_t k = 0;
+        for (uint64_t bk = 0; bk < nb; ++bk) {
+            st[bk] = k;
+            while (k < v.size() && (v[k].first >> (64 - hb)) == bk) ++k;
         }
+        st[nb] = k;
+        for (size_t t = 0; t < v.size(); ++t) { lw[t] = v[t].first & ((1ull << (64 - hb)) - 1); ids[t] = v[t].second; }
+        hbucket.build(st, sigma + 1); hlow.build(lw); hid.build(ids);
     }
-    uint64_t table_bytes() const { return tkey.size() * 8 + tid.size() * 4; }
-    uint64_t succ_bytes() const { return succ.size() * 4 + ccont.size() * 8; }
-    uint64_t sym_bytes() const { return dstart.size() * 4 + jv.size() * 4; }
+
+    uint64_t table_bytes() const { return hbucket.bytes() + hlow.bytes() + hid.bytes(); }
+    uint64_t succ_bytes() const { return succp.bytes() + ccont.size() * 8; }
+    uint64_t sym_bytes() const { return dstart.bytes() + jv.bytes(); }
 
     void save(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("cannot write " + path);
-        fwrite("TWOLVL02", 1, 8, f);
+        fwrite("TWOLVL03", 1, 8, f);
         fwrite(&n, 8, 1, f); fwrite(&m, 8, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&nblocks, 8, 1, f); fwrite(&nsym, 8, 1, f);
         B.save(f); pbwt.save(f); BS.save(f); bbwt.save(f);
-        EliasFano::wv(f, succ); EliasFano::wv(f, dstart); EliasFano::wv(f, jv); EliasFano::wv(f, phash); EliasFano::wv(f, ccont);
+        succp.save(f); dstart.save(f); jv.save(f); EliasFano::wv(f, ccont);
+        fwrite(&hb, 4, 1, f); hbucket.save(f); hlow.save(f); hid.save(f);
         fclose(f);
     }
     void load(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path);
         char mg[8];
-        if (fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "TWOLVL02", 8)) throw std::runtime_error(path + ": not a two-level file");
+        if (fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "TWOLVL03", 8))
+            throw std::runtime_error(path + ": not a two-level file of this version (rebuild it)");
         if (fread(&n, 8, 1, f) != 1 || fread(&m, 8, 1, f) != 1 || fread(&sigma, 4, 1, f) != 1 ||
             fread(&nblocks, 8, 1, f) != 1 || fread(&nsym, 8, 1, f) != 1) throw std::runtime_error("read");
         B.load(f); pbwt.load(f); BS.load(f); bbwt.load(f);
-        EliasFano::rv(f, succ); EliasFano::rv(f, dstart); EliasFano::rv(f, jv); EliasFano::rv(f, phash); EliasFano::rv(f, ccont);
+        succp.load(f); dstart.load(f); jv.load(f); EliasFano::rv(f, ccont);
+        if (fread(&hb, 4, 1, f) != 1) throw std::runtime_error("read");
+        hbucket.load(f); hlow.load(f); hid.load(f);
         fclose(f);
-        build_table();
     }
 };
 
@@ -237,15 +304,23 @@ struct PatInfo {
     std::vector<uint32_t> pid;      // pid[i]: id of P[S[i] .. S[i+1]+K), 0 if not a phrase (or i is last)
     std::vector<uint8_t> cont;      // cont[i]: phrase i is a continuation of phrase i-1
     std::vector<int32_t> bstart;    // bstart[i]: the block of phrase i starts at phrase bstart[i]
-    void build(const Level& L, const std::string& P) {
+    // If mirror is given, it is the PatInfo of the reverse of P, whose syncmers
+    // are reused.
+    void build(const Level& L, const std::string& P, const PatInfo* mirror = nullptr) {
         S.clear();
         const uint8_t* x = reinterpret_cast<const uint8_t*>(P.data());
-        for_each_syncmer(x, P.size(), [&](uint64_t q) { S.push_back((int64_t)q); });
+        if (mirror) {
+            const int64_t m = (int64_t)P.size();
+            S.resize(mirror->S.size());
+            for (size_t i = 0, z = S.size(); i < z; ++i) S[i] = m - K - mirror->S[z - 1 - i];
+        } else {
+            for_each_syncmer(x, P.size(), [&](uint64_t q) { S.push_back((int64_t)q); });
+        }
         size_t z = S.size();
         pid.assign(z, 0); cont.assign(z, 0); bstart.assign(z, 0);
         for (size_t i = 0; i + 1 < z; ++i) pid[i] = L.lookup(phrase_hash(x + S[i], S[i + 1] + K - S[i]));
         for (size_t i = 0; i < z; ++i) {
-            cont[i] = i > 0 && pid[i] && pid[i - 1] && L.succ[pid[i - 1]] == pid[i];
+            cont[i] = i > 0 && pid[i] && pid[i - 1] && L.succ(pid[i - 1]) == pid[i];
             bstart[i] = cont[i] ? bstart[i - 1] : (int32_t)i;
         }
     }

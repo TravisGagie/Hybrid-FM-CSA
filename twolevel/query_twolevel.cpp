@@ -48,7 +48,7 @@ struct Engine {
     tl::PatInfo pi, qi;
 
     void prepare(const std::string& P, const std::string& Q) {
-        if (twolevel) { pi.build(*L, P); qi.build(*Lrev, Q); }
+        if (twolevel) { pi.build(*L, P); qi.build(*Lrev, Q, &pi); }
     }
     rs::SearchResult search(bool reversed, const std::string& X, int64_t begin, int64_t end, Cnt& c) {
         if (twolevel) {
