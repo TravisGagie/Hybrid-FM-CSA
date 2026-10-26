@@ -29,27 +29,22 @@ rm -rf "$T"; mkdir -p "$T"
 (cd "$T" && python3 "$HERE/gen_test.py" 3 200000 0.0005 > /dev/null)
 "$B/rs_build/build_index" --text "$T/collection.txt" --reference-length 200000 --out "$T/idx" --ell 25 --theta 0 > /dev/null 2>&1
 "$B/rs_build/build_index" --text "$T/collection.txt" --reference-length 200000 --out "$T/idxr" --ell 25 --theta 0 --reversed > /dev/null 2>&1
-"$B/build_twolevel" --text "$T/collection.txt" --rlbwt "$T/idx/rlbwt.bin" --out "$T/t.lvl" 2> "$T/build.log"
-"$B/build_twolevel" --text "$T/collection.txt" --rlbwt "$T/idxr/rlbwt.bin" --out "$T/r.lvl" --reversed 2>> "$T/build.log"
-"$B/query_twolevel" --index "$T/idx" --reversed-index "$T/idxr" --level "$T/t.lvl" --reversed-level "$T/r.lvl" \
+"$B/build_twolevel" --text "$T/collection.txt" --rlbwt "$T/idx/rlbwt.bin" --reversed-rlbwt "$T/idxr/rlbwt.bin" --out "$T/lv" 2> "$T/build.log"
+"$B/query_twolevel" --index "$T/idx" --reversed-index "$T/idxr" --level "$T/lv.text.lvl" --reversed-level "$T/lv.rev.lvl" \
   --patterns "$T/queries.txt" --shortcuts ell25_theta0 --min-length 1,100,1000 --repeat 1 > "$T/query.txt" 2> "$T/query.log" \
   || { echo "self-test FAILED (see $T/query.log)"; exit 1; }
 stamp "self-test passed: the same MEMs and intervals as plain search"
 
 TIME=(); if [ -x /usr/bin/time ]; then TIME=(/usr/bin/time -v); fi
-if [ ! -s "$OUT/text_v3.lvl" ]; then
-  stamp "building the levels of T"
-  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_t3/rlbwt.bin" --out "$OUT/text_v3.lvl" 2> "$OUT/build_text.log"
-  grep -E "boundaries|distinct|B:|blocks|BWT|sizes|Maximum resident|Elapsed" "$OUT/build_text.log" || true
-fi
-if [ ! -s "$OUT/rev_v3.lvl" ]; then
-  stamp "building the levels of the reversed collection"
-  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_rev_t3/rlbwt.bin" --out "$OUT/rev_v3.lvl" --reversed 2> "$OUT/build_rev.log"
-  grep -E "boundaries|distinct|B:|blocks|BWT|sizes|Maximum resident|Elapsed" "$OUT/build_rev.log" || true
+if [ ! -s "$OUT/v4.text.lvl" ] || [ ! -s "$OUT/v4.rev.lvl" ]; then
+  stamp "building the levels of T and of the reversed collection"
+  ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$C/collection.txt" --rlbwt "$C/packed_t3/rlbwt.bin" \
+    --reversed-rlbwt "$C/packed_rev_t3/rlbwt.bin" --out "$OUT/v4" 2> "$OUT/build.log"
+  grep -E "^==|boundaries|distinct|B:|blocks|BWT|shared|sizes|Maximum resident|Elapsed" "$OUT/build.log" || true
 fi
 
 Q=(taskset -c "$PIN" "$B/query_twolevel" --index "$C/packed_t3" --reversed-index "$C/packed_rev_t3"
-   --level "$OUT/text_v3.lvl" --reversed-level "$OUT/rev_v3.lvl" --patterns "$C/queries.txt")
+   --level "$OUT/v4.text.lvl" --reversed-level "$OUT/v4.rev.lvl" --patterns "$C/queries.txt")
 if [ "$MODE" = quick ]; then
   stamp "quick run: BML, L = 1000, one round, best shortcuts (t6, ell 25)"
   "${Q[@]}" --shortcuts "ell25_theta0@$C/packed_t6@$C/packed_rev_t6" --algorithm bml --min-length 1000 --repeat 1 \
