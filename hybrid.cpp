@@ -454,7 +454,7 @@ static int do_build(int argc, char** argv) {
     if (kind == "blocks" || kind == "biblocks") {   // block indexes of T (and of T reversed)
         FILE* f = fopen(argv[3], "wb");
         if (!f) { perror(argv[3]); return 1; }
-        fwrite("BLKIDX01", 1, 8, f);
+        fwrite("BLKIDX02", 1, 8, f);
         uint8_t c = e.consecutive, hf = kind == "biblocks";
         fwrite(&e.sigma, 4, 1, f); fwrite(&c, 1, 1, f); fwrite(&e.vals_base, 8, 1, f); fwrite(&hf, 1, 1, f);
         RunRank::wv(f, e.vals);
@@ -1064,6 +1064,7 @@ struct BlockFinder {
     uint64_t np = 0;
     uint64_t steps = 0, fsteps = 0, checks = 0;
     BlockFinder(const BlockBackend& be, const QueryParse& q, bool fwd_ok, bool, bool) : ix(*be.ix) {
+        ix.bw.steps = ix.bw.hsteps = ix.bw.hchecks = ix.fw.steps = ix.fw.hsteps = ix.fw.hchecks = 0;
         np = q.raw.size();
         rev = fwd_ok && ix.have_fw;
         Q.assign(np, 0);
@@ -1071,13 +1072,13 @@ struct BlockFinder {
         hs.assign(np, 0); cut.assign(np, 0);
         for (uint64_t t = 0; t < np; ++t) {
             cut[t] = q.first[t];
-            if (t && !q.first[t] && Q[t] && Q[t - 1] && Q[t] == ix.bw.top[Q[t - 1]]) hs[t] = 1;
+            if (t && !q.first[t] && Q[t] && Q[t - 1] && Q[t] == ix.bw.succ(Q[t - 1])) hs[t] = 1;
         }
         if (rev) {
             Qr.assign(np, 0); hsr.assign(np, 0); cutr.assign(np, 0);
             for (uint64_t t = 0; t < np; ++t) { Qr[t] = Q[np - 1 - t]; cutr[t] = q.last[np - 1 - t]; }
             for (uint64_t t = 1; t < np; ++t)
-                if (!cutr[t] && Qr[t] && Qr[t - 1] && Qr[t] == ix.fw.top[Qr[t - 1]]) hsr[t] = 1;
+                if (!cutr[t] && Qr[t] && Qr[t - 1] && Qr[t] == ix.fw.succ(Qr[t - 1])) hsr[t] = 1;
         }
     }
     void collect() {
@@ -1196,7 +1197,7 @@ static int do_mems(int argc, char** argv) {
     char mg[8];
     if (fread(mg, 1, 8, f) != 8) { fprintf(stderr, "bad index file\n"); return 1; }
     if (!memcmp(mg, "RLCSA002", 8)) return mems_plain(f, argc, argv);
-    if (!memcmp(mg, "BLKIDX01", 8)) return mems_blocks(f, argc, argv);
+    if (!memcmp(mg, "BLKIDX02", 8)) return mems_blocks(f, argc, argv);
     Encoding e;
     if (memcmp(mg, "PSIE", 4)) { fprintf(stderr, "bad index file\n"); return 1; }
     e.load(f, mg[7] - '0');
@@ -1504,7 +1505,7 @@ static int do_blockbench(int argc, char** argv) {
            (unsigned long long)bi.nb, (double)bi.n / max<uint64_t>(bi.nb, 1), (unsigned long long)bi.nsym);
     printf("block index %s (block BWT %s, hash bits %s, H %s, s %s, block symbols %s), built in %.1fs\n",
            mb(bi.bytes()).c_str(), mb(bi.bbwt.bytes()).c_str(), mb(bi.hashbit.bytes()).c_str(), mb(bi.H.bytes()).c_str(),
-           mb(bi.top.size() * 4).c_str(), mb(bi.jv.size() * 2 + bi.dstart.bytes()).c_str(), tb);
+           mb(bi.s_bytes()).c_str(), mb(bi.jv.size() * 2 + bi.dstart.bytes()).c_str(), tb);
     printf("RLCSA of T %s, built in %.1fs\n", mb(fm.bytes()).c_str(), tr);
     mt19937_64 rng(12345);
     printf("count time, microseconds per query (%zu random substrings of T per m); block steps and hash steps per query\n", Q);

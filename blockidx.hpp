@@ -22,10 +22,14 @@
 //   - H: for the rows that start with a hash, the character that hash stands for, which
 //     resolves a pattern's leading characters exactly (they may be hashes in the text);
 //   - Ncnt[k]: the number of rows that start with at least k hashes;
-//   - s, and the block symbols of each d (their j values), to encode patterns.
+//   - s, and the block symbols of each d (their j values), to encode patterns.  Phrase ids
+//     are given in order of first appearance, so s(x) is often x+1 (or, in the index of the
+//     reversed text, x-1): s is stored as one bit per character saying whether s(x) = x+delta,
+//     plus the other values packed in ceil(lg(sigma+1)) bits each.
 // Counting and longest-suffix search are exact.
 #pragma once
 #include "efrank.hpp"
+#include "huffwt.hpp"
 #include <vector>
 #include <algorithm>
 #include <cstdint>
@@ -36,7 +40,45 @@
 struct BlockIndex {
     uint32_t sigma = 0;                 // real characters 1..sigma (dense ids)
     uint32_t sep = 0;                   // separator id (never predicted, never predicts)
-    std::vector<uint32_t> top;          // sigma+1: most frequent successor (0 = none)
+    std::vector<uint32_t> top;          // sigma+1: most frequent successor (0 = none); only while building
+    int32_t delta = 1;                  // s(x) = x + delta for the characters marked in sdef
+    RankBV sdef;                        // bit x: s(x) = x + delta
+    std::vector<uint64_t> sexc;         // the other values of s, packed
+    uint32_t sw = 1;                    // bits per packed value
+    inline uint32_t succ(uint32_t x) const {
+        if (x == 0 || x > sigma) return 0;
+        uint64_t r1 = sdef.rank1(x);
+        if (sdef.rank1(x + 1) > r1) return (uint32_t)((int64_t)x + delta);
+        uint64_t k = x - r1, p = k * sw, w = p >> 6, o = p & 63;
+        uint64_t v = sexc[w] >> o;
+        if (o + sw > 64) v |= sexc[w + 1] << (64 - o);
+        return (uint32_t)(v & ((sw == 64) ? ~0ull : ((1ull << sw) - 1)));
+    }
+    void pack_s() {
+        uint64_t up = 0, dn = 0;
+        for (uint32_t x = 1; x <= sigma; ++x) { up += top[x] == x + 1; dn += top[x] + 1 == x; }
+        delta = up >= dn ? 1 : -1;
+        sw = 1; while ((1ull << sw) <= sigma) ++sw;
+        std::vector<uint64_t> bits((sigma + 2) / 64 + 1, 0);
+        std::vector<uint32_t> ex;
+        for (uint32_t x = 0; x <= sigma; ++x) {
+            bool d = x > 0 && (int64_t)top[x] == (int64_t)x + delta;
+            if (d) bits[x >> 6] |= 1ull << (x & 63);
+            else ex.push_back(top[x]);
+        }
+        sdef.build(bits, sigma + 2);
+        sexc.assign((ex.size() * sw) / 64 + 2, 0);
+        for (uint64_t k = 0; k < ex.size(); ++k) {
+            uint64_t p = k * sw, w = p >> 6, o = p & 63;
+            sexc[w] |= (uint64_t)ex[k] << o;
+            if (o + sw > 64) sexc[w + 1] |= (uint64_t)ex[k] >> (64 - o);
+        }
+        nsdef = up >= dn ? up : dn;
+        for (uint32_t x = 1; x <= sigma; ++x) if (succ(x) != top[x]) throw std::runtime_error("pack_s");
+        std::vector<uint32_t>().swap(top);
+    }
+    uint64_t nsdef = 0;
+    uint64_t s_bytes() const { return sdef.bytes() + sexc.size() * 8; }
     EliasFano dstart;                   // sigma+2: first block symbol (minus 1) of each d
     std::vector<uint16_t> jv;           // j value of each block symbol (descending within d)
     uint64_t nsym = 0;                  // block symbols (ids 1..nsym; 0 = terminator)
@@ -193,6 +235,9 @@ struct BlockIndex {
             ncnt.assign(maxj + 2, 0);
             for (int64_t m2 = (int64_t)maxj; m2 >= 1; --m2) ncnt[m2] = ge[m2] + ncnt[m2 + 1];
             if (ncnt[1] != nh) throw std::runtime_error("hash count mismatch");
+            pack_s();
+            if (verbose) fprintf(stderr, "  s: s(x) = x%+d for %.1f%% of characters; %.1f MB\n", delta,
+                                 100.0 * nsdef / std::max<uint32_t>(sigma, 1), s_bytes() / 1048576.0);
             if (verbose) fprintf(stderr, "  E: %llu hash rows; hash bits %.1f MB, H %.1f MB\n",
                                  (unsigned long long)nh, hashbit.bytes() / 1048576.0, H.bytes() / 1048576.0);
         }
@@ -206,7 +251,7 @@ struct BlockIndex {
         for (auto x : p) if (x == 0 || x > sigma || x == sep) return 0;
         // block starts in the pattern
         std::vector<uint8_t> hs(m, 0);
-        for (size_t t = 1; t < m; ++t) hs[t] = (p[t] == top[p[t - 1]]);
+        for (size_t t = 1; t < m; ++t) hs[t] = (p[t] == succ(p[t - 1]));
         // last block [a, m-1]
         size_t a = m - 1; while (a > 0 && hs[a]) --a;
         uint32_t len = (uint32_t)(m - 1 - a);      // hashes after p[a]
@@ -311,19 +356,22 @@ struct BlockIndex {
     }
 
     uint64_t bytes() const {
-        return top.size() * 4 + dstart.bytes() + jv.size() * 2 + bbwt.bytes() + hashbit.bytes() + H.bytes() + ncnt.size() * 8;
+        return s_bytes() + dstart.bytes() + jv.size() * 2 + bbwt.bytes() + hashbit.bytes() + H.bytes() + ncnt.size() * 8;
     }
     void save(FILE* f) const {
         fwrite(&sigma, 4, 1, f); fwrite(&sep, 4, 1, f); fwrite(&nsym, 8, 1, f); fwrite(&n, 8, 1, f);
         fwrite(&nb, 8, 1, f); fwrite(&nh, 8, 1, f); fwrite(&hb_c1, 8, 1, f);
-        EliasFano::wv(f, top); dstart.save(f); EliasFano::wv(f, jv); bbwt.save(f); hashbit.save(f); H.save(f);
+        fwrite(&delta, 4, 1, f); fwrite(&sw, 4, 1, f); fwrite(&nsdef, 8, 1, f); sdef.save(f); EliasFano::wv(f, sexc);
+        dstart.save(f); EliasFano::wv(f, jv); bbwt.save(f); hashbit.save(f); H.save(f);
         EliasFano::wv(f, ncnt);
     }
     void load(FILE* f) {
         if (fread(&sigma, 4, 1, f) != 1 || fread(&sep, 4, 1, f) != 1 || fread(&nsym, 8, 1, f) != 1 ||
             fread(&n, 8, 1, f) != 1 || fread(&nb, 8, 1, f) != 1 || fread(&nh, 8, 1, f) != 1 ||
             fread(&hb_c1, 8, 1, f) != 1) throw std::runtime_error("read");
-        EliasFano::rv(f, top); dstart.load(f); EliasFano::rv(f, jv); bbwt.load(f); hashbit.load(f); H.load(f);
+        if (fread(&delta, 4, 1, f) != 1 || fread(&sw, 4, 1, f) != 1 || fread(&nsdef, 8, 1, f) != 1) throw std::runtime_error("read");
+        sdef.load(f); EliasFano::rv(f, sexc);
+        dstart.load(f); EliasFano::rv(f, jv); bbwt.load(f); hashbit.load(f); H.load(f);
         EliasFano::rv(f, ncnt);
     }
 };
