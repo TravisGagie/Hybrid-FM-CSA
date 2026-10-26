@@ -23,25 +23,54 @@ using Clock = std::chrono::steady_clock;
 
 static double secs(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
+// The text T = S_1 # ... # S_k # $ of a collection file with one sequence per
+// line, as rs::read_text builds it (empty lines skipped, CR dropped), but read
+// in one piece so that the memory is not doubled while it grows.
+static std::vector<uint8_t> read_collection(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open " + path);
+    fseek(f, 0, SEEK_END);
+    long long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> X((size_t)sz + 2);
+    if (sz > 0 && fread(X.data(), 1, (size_t)sz, f) != (size_t)sz) throw std::runtime_error("cannot read " + path);
+    fclose(f);
+    if (sz > 0 && X[0] == '>') throw std::runtime_error(path + ": FASTA is not supported; use one sequence per line");
+    size_t w = 0;
+    bool in_line = false;
+    for (size_t i = 0; i < (size_t)sz; ++i) {
+        uint8_t c = X[i];
+        if (c == '\r') continue;
+        if (c == '\n') { if (in_line) X[w++] = rs::kSeparator; in_line = false; continue; }
+        if (c == rs::kSeparator || c == rs::kTerminator) throw std::runtime_error(path + " contains a byte 0x00 or 0x01");
+        X[w++] = c; in_line = true;
+    }
+    if (in_line) X[w++] = rs::kSeparator;
+    X[w++] = rs::kTerminator;
+    X.resize(w);
+    X.shrink_to_fit();
+    return X;
+}
+
 // Builds the levels of one direction.  hf[id] and hr[id] are the hashes of
 // phrase id and of its reverse, for joining the two directions' dictionaries.
 static void build_level(const std::string& text_path, bool reversed, const std::string& rlbwt_path, Level& L,
                         std::vector<uint64_t>& hf, std::vector<uint64_t>& hr, Clock::time_point t0) {
-    std::vector<uint8_t> X = rs::read_text(text_path);
+    std::vector<uint8_t> X = read_collection(text_path);
     if (reversed) {   // S_1 # ... # S_k # $  ->  rev(S_k) # ... # rev(S_1) # $
         std::reverse(X.begin(), X.end() - 1);
         std::rotate(X.begin(), X.begin() + 1, X.end() - 1);
     }
     const uint64_t n = X.size();
-    if (n >= (1ull << 32)) throw std::runtime_error("text too long (positions are 32-bit)");
     std::cerr << "text: " << n << " characters (" << secs(t0) << " s)\n";
 
     // boundaries
-    std::vector<uint32_t> b;
+    std::vector<uint64_t> b;
     bool zero_is_syncmer = false;
-    for_each_syncmer(X.data(), n, [&](uint64_t q) { if (q == 0) zero_is_syncmer = true; b.push_back((uint32_t)q); });
+    for_each_syncmer(X.data(), n, [&](uint64_t q) { if (q == 0) zero_is_syncmer = true; b.push_back(q); });
     if (!zero_is_syncmer) b.insert(b.begin(), 0);
     const uint64_t m = b.size();
+    if (m + 1 >= (1ull << 31)) throw std::runtime_error("too many phrases for a 32-bit parse suffix array");
     auto plen = [&](uint64_t i) -> uint64_t { return i + 1 < m ? b[i + 1] + K - b[i] : n - b[i]; };
     std::cerr << "boundaries: " << m << " (" << secs(t0) << " s)\n";
 
@@ -102,25 +131,25 @@ static void build_level(const std::string& text_path, bool reversed, const std::
     std::cerr << "sorted (" << secs(t0) << " s)\n";
 
     // distinct syncmers: phrases with equal first K characters are adjacent in id order
-    std::vector<uint32_t> synrep;     // a text position of each distinct syncmer
+    std::vector<uint64_t> synrep;     // a text position of each distinct syncmer
     {
         uint32_t skip = zero_is_syncmer ? 0 : pz[0];
-        int64_t prev = -1;
+        int64_t prev = -1;  // position of the previous distinct syncmer
         for (uint32_t r = 0; r < sigma; ++r) {
             uint32_t a = order[r];
             if (r + 1 == skip) continue;
-            uint32_t pos = b[rep[a]];
+            uint64_t pos = b[rep[a]];
             if (prev < 0 || std::memcmp(X.data() + prev, X.data() + pos, K)) { synrep.push_back(pos); prev = pos; }
         }
     }
     const size_t nsyn = synrep.size();
     std::vector<uint8_t> syn(nsyn * K);
     for (size_t k = 0; k < nsyn; ++k) std::memcpy(syn.data() + k * K, X.data() + synrep[k], K);
-    std::vector<uint32_t>().swap(synrep);
+    std::vector<uint64_t>().swap(synrep);
     std::vector<uint32_t>().swap(rep); std::vector<uint64_t>().swap(rhash);
     std::vector<uint32_t>().swap(order); std::vector<uint32_t>().swap(idof);
     std::vector<uint8_t>().swap(X);
-    std::vector<uint32_t>().swap(b);
+    std::vector<uint64_t>().swap(b);
     std::cerr << "distinct syncmers: " << nsyn << "\n";
 
     // B: the union of the syncmers' intervals, and the row of position 0
