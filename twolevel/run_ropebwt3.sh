@@ -12,6 +12,7 @@
 # SMEM.  Query time = time from "loaded the BWT" to "processed", as ropebwt3
 # logs them.  Run run_desktop.sh for the same size first (it cuts the collection).
 set -euo pipefail
+export LC_ALL=C   # sort and comm must agree on the order
 HERE=$(cd "$(dirname "$0")" && pwd)
 DATA=${DATA:-$HOME/shortcuts/chr19_scaling/hprc_chr19/n16}
 MODE=${MODE:-quick}
