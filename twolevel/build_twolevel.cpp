@@ -298,7 +298,7 @@ static void build_level(const std::string& text_path, bool reversed, const std::
         L.BS.build(rows, m + 2);
         L.bbwt.build(bw, (uint32_t)L.nsym + 1);
     }
-    std::cerr << "block BWT: " << L.bbwt.nruns << " runs, " << L.bbwt.bytes() / 1e6 << " MB; BS " << L.BS.bytes() / 1e6
+    std::cerr << "block BWT: " << L.bbwt.nruns << " runs, " << L.bbwt.bytes() / 1e6 << " MB; BS " << L.BS.bytes() / 1e6 << (L.BS.rl ? " (run-length, " + std::to_string(L.BS.r.nruns) + " runs" : std::string(" (Elias-Fano")) << "; the other encoding " << L.BS.alt_bytes / 1e6 << " MB)"
               << " MB (" << secs(t0) << " s)\n";
 }
 

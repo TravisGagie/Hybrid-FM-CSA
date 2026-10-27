@@ -84,10 +84,10 @@ PY
 
 # ---- exactness: compare with the MEMs of the two-level index (identical to plain search)
 B="$HERE/build"; LV="$HERE/results/$SIZE"
-if [ -x "$B/query_twolevel" ] && [ -s "$LV/v4.text.lvl" ]; then
+if [ -x "$B/query_twolevel" ] && [ -s "$LV/v5.text.lvl" ]; then
   stamp "comparing with our MEMs"
   mkdir -p "$OUT/ours"
-  "$B/query_twolevel" --index "$DATA/fwd_t3" --reversed-index "$DATA/rev_t3" --level "$LV/v4.text.lvl" --reversed-level "$LV/v4.rev.lvl" \
+  "$B/query_twolevel" --index "$DATA/fwd_t3" --reversed-index "$DATA/rev_t3" --level "$LV/v5.text.lvl" --reversed-level "$LV/v5.rev.lvl" \
     --patterns "$QUER" --configs 2LJ --algorithm bml,fb --min-length 100,1000 --repeat 1 --dump "$OUT/ours" > /dev/null 2>&1
   cmpm() {  # $1: our files prefix, $2: ropebwt3 output, $3: min length
     (awk '{print "q0\t"$1"\t"$2}' "$OUT/ours/$1_q0.tsv"; awk '{print "q1\t"$1"\t"$2}' "$OUT/ours/$1_q1.tsv") | sort > "$OUT/a.txt"

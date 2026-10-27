@@ -8,6 +8,7 @@
 #   MODE=full bash run_desktop.sh                # all shortcut configurations found, BML L = 100 and 1000,
 #                                                # forward-backward L = 1000, 5 rounds each (hours)
 #   MODE=lean bash run_desktop.sh                # as full, but only plain, the fastest shortcuts and two-level
+#   MODE=twolevel bash run_desktop.sh            # only the two two-level versions (minutes)
 #   DATA=.../n32 MODE=full bash run_desktop.sh   # another collection size
 #
 # Nothing under ~/shortcuts is changed; levels and results go to ./results/<size>.
@@ -91,15 +92,15 @@ rm -rf "$T"; mkdir -p "$T"
 stamp "self-test passed: the same MEMs and intervals as plain search"
 
 TIME=(); if [ -x /usr/bin/time ]; then TIME=(/usr/bin/time -v); fi
-if [ ! -s "$OUT/v4.text.lvl" ] || [ ! -s "$OUT/v4.rev.lvl" ]; then
+if [ ! -s "$OUT/v5.text.lvl" ] || [ ! -s "$OUT/v5.rev.lvl" ]; then
   stamp "building the levels of T and of the reversed collection"
   ${TIME[@]+"${TIME[@]}"} "$B/build_twolevel" --text "$COLL" --rlbwt "$FWD/rlbwt.bin" --reversed-rlbwt "$REV/rlbwt.bin" \
-    --out "$OUT/v4" 2> "$OUT/build.log" || { grep -v '^\s' "$OUT/build.log" | tail -5; exit 1; }
+    --out "$OUT/v5" 2> "$OUT/build.log" || { grep -v '^\s' "$OUT/build.log" | tail -5; exit 1; }
   grep -E "^==|boundaries|distinct|B:|blocks|BWT|shared|sizes|Maximum resident|Elapsed" "$OUT/build.log" || true
 fi
 
 Q=(taskset -c "$PIN" "$B/query_twolevel" --index "$FWD" --reversed-index "$REV"
-   --level "$OUT/v4.text.lvl" --reversed-level "$OUT/v4.rev.lvl" --patterns "$QUER")
+   --level "$OUT/v5.text.lvl" --reversed-level "$OUT/v5.rev.lvl" --patterns "$QUER")
 stamp "queries pinned to CPU $PIN"
 case "$MODE" in
   quick)
@@ -111,6 +112,11 @@ case "$MODE" in
     "${Q[@]}" --shortcuts "$S" --algorithm bml --min-length 100,1000 --repeat 5 --csv "$OUT/${MODE}_bml.csv" 2>&1 | tee "$OUT/${MODE}_bml.txt"
     stamp "$MODE run: forward-backward, L = 1000"
     "${Q[@]}" --shortcuts "$S" --algorithm fb --min-length 1000 --repeat 5 --csv "$OUT/${MODE}_fb.csv" 2>&1 | tee "$OUT/${MODE}_fb.txt" ;;
+  twolevel)   # only the two-level index (5 rounds); plain search and the shortcuts are in the lean/full results
+    stamp "two-level only: BML, L = 100 and 1000"
+    "${Q[@]}" --configs 2L,2LJ --algorithm bml --min-length 100,1000 --repeat 5 --csv "$OUT/tl_bml.csv" 2>&1 | tee "$OUT/tl_bml.txt"
+    stamp "two-level only: forward-backward, L = 1000"
+    "${Q[@]}" --configs 2L,2LJ --algorithm fb --min-length 1000 --repeat 5 --csv "$OUT/tl_fb.csv" 2>&1 | tee "$OUT/tl_fb.txt" ;;
   *) echo "unknown MODE $MODE"; exit 1 ;;
 esac
 stamp "done"

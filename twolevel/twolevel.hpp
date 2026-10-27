@@ -255,6 +255,34 @@ struct PhraseDict {
     }
 };
 
+// The block-start rows: Elias-Fano or run-length coded, whichever is smaller.
+struct BlockStarts {
+    uint8_t rl = 0;
+    uint64_t alt_bytes = 0;         // size of the encoding not chosen (at build time)
+    EliasFano ef;
+    RLBits r;
+    void build(const std::vector<uint64_t>& rows, uint64_t universe) {
+        std::vector<std::pair<uint64_t, uint64_t>> runs;
+        for (uint64_t x : rows) {
+            if (!runs.empty() && runs.back().first + runs.back().second == x) ++runs.back().second;
+            else runs.push_back({x, 1});
+        }
+        r.build(runs, universe);
+        ef.build(rows, universe);
+        rl = r.bytes() < ef.bytes();
+        alt_bytes = rl ? ef.bytes() : r.bytes();
+        if (rl) ef = EliasFano(); else r = RLBits();
+    }
+    inline uint64_t count_less(uint64_t x) const { return rl ? r.rank1(x) : ef.count_less(x); }
+    inline uint64_t access(uint64_t k) const { return rl ? r.select1(k) : ef.access(k); }
+    uint64_t bytes() const { return rl ? r.bytes() : ef.bytes(); }
+    void save(FILE* f) const { fwrite(&rl, 1, 1, f); if (rl) r.save(f); else ef.save(f); }
+    void load(FILE* f) {
+        if (fread(&rl, 1, 1, f) != 1) throw std::runtime_error("read");
+        if (rl) r.load(f); else ef.load(f);
+    }
+};
+
 struct Level {
     uint64_t n = 0;          // rows of the character-level BWT
     uint64_t m = 0;          // phrases; the parse has m + 1 rows
@@ -263,7 +291,7 @@ struct Level {
     uint64_t nsym = 0;       // distinct block symbols, ids 1..nsym
     RLBits B;
     EFRank pbwt;
-    EliasFano BS;
+    BlockStarts BS;
     EFRank bbwt;
     PackedInts succp;               // succ(x), x = 0..sigma (0: none)
     EliasFano dstart;               // sigma + 2 values: symbols of d are dstart[d] .. dstart[d+1]-1 (0-based)
@@ -295,7 +323,7 @@ struct Level {
     void save(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("cannot write " + path);
-        fwrite("TWOLVL04", 1, 8, f);
+        fwrite("TWOLVL05", 1, 8, f);
         fwrite(&n, 8, 1, f); fwrite(&m, 8, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&nblocks, 8, 1, f); fwrite(&nsym, 8, 1, f);
         B.save(f); pbwt.save(f); BS.save(f); bbwt.save(f);
         succp.save(f); dstart.save(f); jv.save(f); EliasFano::wv(f, ccont);
@@ -306,7 +334,7 @@ struct Level {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path);
         char mg[8];
-        if (fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "TWOLVL04", 8))
+        if (fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "TWOLVL05", 8))
             throw std::runtime_error(path + ": not a two-level file of this version (rebuild it)");
         if (fread(&n, 8, 1, f) != 1 || fread(&m, 8, 1, f) != 1 || fread(&sigma, 4, 1, f) != 1 ||
             fread(&nblocks, 8, 1, f) != 1 || fread(&nsym, 8, 1, f) != 1) throw std::runtime_error("read");

@@ -211,7 +211,7 @@ int main(int argc, char** argv) {
             }
             E.push_back(std::move(e));
         }
-        if (E.empty() || (E.size() > 1 && E[0].name != "plain")) throw std::runtime_error("the first configuration must be plain");
+        if (E.empty()) throw std::runtime_error("no configurations");   // the first is the reference (normally plain)
 
         std::vector<std::string> pats;
         {
