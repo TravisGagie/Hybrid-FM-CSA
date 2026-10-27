@@ -13,7 +13,10 @@
 //
 //   query_twolevel --index DIR --reversed-index DIR --level FILE --reversed-level FILE --patterns FILE
 //                  [--shortcuts NAME,...] [--algorithm fb,bml] [--min-length 100,1000] [--repeat 5]
-//                  [--configs plain,2L,2LJ] [--csv FILE]
+//                  [--configs plain,2L,2LJ] [--csv FILE] [--dump DIR]
+//
+// --dump DIR writes the MEMs of the first configuration (normally plain search) to
+// DIR/ALG_LL_qQ.tsv (start, end, occurrences).
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -123,7 +126,7 @@ std::vector<std::string> split(const std::string& s) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string idx, ridx, lev, rlev, pat, csvp;
+    std::string idx, ridx, lev, rlev, pat, csvp, dumpdir;
     std::vector<std::string> scn, algs = {"fb", "bml"}, configs = {"plain", "2L", "2LJ"};
     std::vector<int64_t> Ls = {100, 1000};
     int64_t repeat = 5;
@@ -141,6 +144,7 @@ int main(int argc, char** argv) {
         else if (f == "--repeat") repeat = std::max<int64_t>(1, std::stoll(v));
         else if (f == "--configs") { configs = split(v); configs_given = true; }
         else if (f == "--csv") csvp = v;
+        else if (f == "--dump") dumpdir = v;
         else { std::cerr << "unknown flag " << f << "\n"; return 1; }
     }
     if (argc % 2 == 0 || idx.empty() || ridx.empty() || pat.empty()) {
@@ -207,7 +211,7 @@ int main(int argc, char** argv) {
             }
             E.push_back(std::move(e));
         }
-        if (E.empty() || E[0].name != "plain") throw std::runtime_error("the first configuration must be plain");
+        if (E.empty() || (E.size() > 1 && E[0].name != "plain")) throw std::runtime_error("the first configuration must be plain");
 
         std::vector<std::string> pats;
         {
@@ -245,7 +249,13 @@ int main(int argc, char** argv) {
                             }
                             times[c].push_back(std::chrono::duration<double, std::nano>(Clock::now() - t1).count());
                             cs[c] = cn;
-                            if (c == 0) ref = std::move(res);
+                            if (c == 0) {
+                                ref = std::move(res);
+                                if (k == 0 && !dumpdir.empty()) {   // the MEMs: start, end (0-based, half-open), occurrences
+                                    std::ofstream d(dumpdir + "/" + alg + "_L" + std::to_string(Lm) + "_q" + std::to_string(q) + ".tsv");
+                                    for (auto& x : ref) d << x.start << '\t' << x.end << '\t' << (x.hi - x.lo + 1) << '\n';
+                                }
+                            }
                             else if (res != ref) {
                                 ++mism;
                                 std::cerr << "MISMATCH: " << E[c].name << ", " << alg << ", L = " << Lm << ", pattern " << q << " ("
