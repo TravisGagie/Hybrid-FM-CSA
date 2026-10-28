@@ -4,6 +4,8 @@
 // reportable-shortcuts code.
 //
 //   build_twolevel --text COLLECTION --rlbwt DIR/rlbwt.bin --reversed-rlbwt REVDIR/rlbwt.bin --out PREFIX
+//   build_twolevel --text COLLECTION --block-stats     (block statistics only)
+//   ... --continuation frequent   (continuations: the most frequent successor, not the smallest)
 //
 // COLLECTION is the collection file the RLBWTs were built from (one sequence per
 // line); the second RLBWT is that of the reversed collection
@@ -24,6 +26,8 @@
 
 using namespace tl;
 using Clock = std::chrono::steady_clock;
+static bool g_stats_only = false;
+static bool g_frequent = false;      // --continuation frequent: the most frequent successor
 
 static double secs(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
 
@@ -81,6 +85,64 @@ struct TextStream {
         return true;
     }
 };
+
+// Block statistics for other choices of the continuation c(x) of each phrase x
+// (--block-stats): the smallest successor (as built), the largest, whichever of
+// those two is more frequent after x, and the most frequent successor.  Any
+// choice keeps the block BWT in parse order if a block's symbol also records on
+// which side of c(last phrase) the next block's first phrase lies; the smallest
+// (largest) successor needs no side bit, since that phrase is always larger
+// (smaller).  The most frequent successor maximizes the number of continuations.
+static void block_stats(const std::vector<uint32_t>& pz, uint32_t sigma) {
+    const uint64_t m = pz.size();
+    std::vector<uint32_t> cmin(sigma + 1, 0), cmax(sigma + 1, 0), cfrq(sigma + 1, 0);
+    std::vector<uint64_t> nmin(sigma + 1, 0), nmax(sigma + 1, 0);
+    {
+        std::vector<uint64_t> pr;
+        pr.reserve(m ? m - 1 : 0);
+        for (uint64_t i = 0; i + 1 < m; ++i) pr.push_back((uint64_t)pz[i] << 32 | pz[i + 1]);
+        std::sort(pr.begin(), pr.end());
+        uint64_t distinct = 0, single = 0;
+        for (uint64_t a = 0; a < pr.size();) {
+            uint32_t x = (uint32_t)(pr[a] >> 32);
+            uint64_t b = a, best = 0, ny = 0;
+            while (b < pr.size() && (uint32_t)(pr[b] >> 32) == x) {
+                uint64_t c = b;
+                while (c < pr.size() && pr[c] == pr[b]) ++c;
+                uint32_t y = (uint32_t)pr[b];
+                if (!cmin[x]) { cmin[x] = y; nmin[x] = c - b; }
+                cmax[x] = y; nmax[x] = c - b;
+                if (c - b > best) { best = c - b; cfrq[x] = y; }
+                ++ny; b = c;
+            }
+            distinct += ny; if (ny == 1) ++single;
+            a = b;
+        }
+        std::cerr << "block stats: " << m << " phrases, " << sigma << " distinct, " << distinct
+                  << " distinct adjacent pairs; " << single << " phrases with a single successor\n";
+    }
+    std::vector<uint32_t> cmm(sigma + 1);
+    for (uint32_t x = 0; x <= sigma; ++x) cmm[x] = nmax[x] > nmin[x] ? cmax[x] : cmin[x];
+    const char* names[4] = {"smallest successor", "largest successor", "smaller or larger, more frequent", "most frequent successor"};
+    const std::vector<uint32_t>* cs[4] = {&cmin, &cmax, &cmm, &cfrq};
+    for (int r = 0; r < 4; ++r) {
+        const auto& c = *cs[r];
+        std::vector<uint64_t> keys;       // d, j, side
+        uint64_t start = 0;
+        for (uint64_t i = 1; i <= m; ++i)
+            if (i == m || c[pz[i - 1]] != pz[i]) {
+                uint64_t j = i - 1 - start;
+                int side = (i < m && pz[i] > c[pz[i - 1]]) ? 1 : 0;
+                if (r != 3) side = 0;  // the side is implied by the choice
+                keys.push_back((uint64_t)pz[start] << 33 | (j & 0xffffffffull) << 1 | (uint64_t)side);
+                start = i;
+            }
+        uint64_t nb = keys.size();
+        std::sort(keys.begin(), keys.end());
+        uint64_t ns = std::unique(keys.begin(), keys.end()) - keys.begin();
+        std::cerr << "  " << names[r] << ": " << nb << " blocks (" << (double)m / nb << " phrases each), " << ns << " symbols\n";
+    }
+}
 
 // Builds the levels of one direction.  hf[id] and hr[id] are the hashes of
 // phrase id and of its reverse, for joining the two directions' dictionaries.
@@ -157,6 +219,7 @@ static void build_level(const std::string& text_path, bool reversed, const std::
     std::vector<uint32_t> idof(sigma);
     for (uint32_t r = 0; r < sigma; ++r) idof[order[r]] = r + 1;
     for (auto& x : pz) x = idof[x];
+    if (g_stats_only) { block_stats(pz, (uint32_t)rhash.size()); return; }
     L.n = n; L.m = m; L.sigma = sigma;
     hf.assign(sigma + 1, 0); hr.assign(sigma + 1, 0);
     {
@@ -224,9 +287,24 @@ static void build_level(const std::string& text_path, bool reversed, const std::
 
     // successors and blocks
     std::vector<uint32_t> succ(sigma + 1, 0);
-    for (uint64_t i = 0; i + 1 < m; ++i) {
-        uint32_t& s = succ[pz[i]];
-        if (!s || pz[i + 1] < s) s = pz[i + 1];
+    if (!g_frequent) {
+        for (uint64_t i = 0; i + 1 < m; ++i) {
+            uint32_t& s = succ[pz[i]];
+            if (!s || pz[i + 1] < s) s = pz[i + 1];
+        }
+    } else {      // the most frequent successor (ties: the smallest)
+        std::vector<uint64_t> pr;
+        pr.reserve(m ? m - 1 : 0);
+        for (uint64_t i = 0; i + 1 < m; ++i) pr.push_back((uint64_t)pz[i] << 32 | pz[i + 1]);
+        std::sort(pr.begin(), pr.end());
+        std::vector<uint64_t> best(sigma + 1, 0);
+        for (uint64_t a = 0; a < pr.size();) {
+            uint64_t b = a;
+            while (b < pr.size() && pr[b] == pr[a]) ++b;
+            uint32_t x = (uint32_t)(pr[a] >> 32);
+            if (b - a > best[x]) { best[x] = b - a; succ[x] = (uint32_t)pr[a]; }
+            a = b;
+        }
     }
     std::vector<uint8_t> cont(m + 1, 0);
     L.ccont.assign(sigma / 64 + 1, 0);
@@ -235,14 +313,19 @@ static void build_level(const std::string& text_path, bool reversed, const std::
         if (cont[i]) L.ccont[pz[i] >> 6] |= 1ull << (pz[i] & 63);
     }
     // symbol of the block ending just before each block start (and m)
-    std::vector<uint64_t> pairs;      // d << 32 | (~j), sorted gives d ascending, j descending
+    // keys d << 33 | Level::sym_key(j, side): sorted, the symbol order of Level::sym.  With
+    // the smallest successor the next block's first phrase is always larger than succ
+    // (+); the last block, followed by the sentinel, is given + too, which is safe since
+    // its last phrase occurs only once.
+    std::vector<uint64_t> pairs;
     {
         uint64_t start = 0;
         for (uint64_t i = 1; i <= m; ++i)
             if (i == m || !cont[i]) {
                 uint64_t j = i - 1 - start;
                 if (j >= (1ull << 32) - 1) throw std::runtime_error("block too long");
-                pairs.push_back(((uint64_t)pz[start] << 32) | (uint32_t)~(uint32_t)j);
+                bool plus = !g_frequent || (i < m && pz[i] > succ[pz[i - 1]]);
+                pairs.push_back(((uint64_t)pz[start] << 33) | Level::sym_key(j, plus));
                 start = i;
             }
     }
@@ -253,9 +336,15 @@ static void build_level(const std::string& text_path, bool reversed, const std::
     L.nsym = syms.size();
     {
         std::vector<uint64_t> ds(sigma + 2, 0), jvv(syms.size());
-        for (size_t k = 0; k < syms.size(); ++k) { ds[(syms[k] >> 32) + 1]++; jvv[k] = ~(uint32_t)syms[k]; }
+        std::vector<uint8_t> plus(syms.size());
+        for (size_t k = 0; k < syms.size(); ++k) {
+            ds[(syms[k] >> 33) + 1]++;
+            plus[k] = (syms[k] >> 32) & 1;
+            uint64_t low = syms[k] & 0xffffffffull;
+            jvv[k] = plus[k] ? 0xffffffffull - low : low;
+        }
         for (uint32_t d = 0; d <= sigma; ++d) ds[d + 1] += ds[d];
-        L.set_symbols(ds, jvv);
+        L.set_symbols(ds, jvv, plus, g_frequent);
     }
     L.set_succ(succ);
     std::vector<uint32_t>().swap(succ);
@@ -310,7 +399,21 @@ int main(int argc, char** argv) {
         else if (i + 1 < argc && a == "--rlbwt") rlbwt_path = argv[++i];
         else if (i + 1 < argc && a == "--reversed-rlbwt") rev_path = argv[++i];
         else if (i + 1 < argc && a == "--out") out_prefix = argv[++i];
+        else if (a == "--block-stats") g_stats_only = true;
+        else if (i + 1 < argc && a == "--continuation") {
+            std::string v = argv[++i];
+            if (v == "frequent") g_frequent = true;
+            else if (v != "smallest") { std::cerr << "--continuation smallest|frequent\n"; return 1; }
+        }
         else { std::cerr << "unknown argument " << a << "\n"; return 1; }
+    }
+    if (g_stats_only && !text_path.empty()) {
+        // statistics only: the parse of T, no RLBWT needed
+        try {
+            Level L; std::vector<uint64_t> hf, hr;
+            build_level(text_path, false, "", L, hf, hr, Clock::now());
+        } catch (const std::exception& e) { std::cerr << "error: " << e.what() << "\n"; return 1; }
+        return 0;
     }
     if (text_path.empty() || rlbwt_path.empty() || rev_path.empty() || out_prefix.empty()) {
         std::cerr << "usage: build_twolevel --text COLLECTION --rlbwt DIR/rlbwt.bin --reversed-rlbwt REVDIR/rlbwt.bin --out PREFIX\n";

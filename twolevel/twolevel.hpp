@@ -23,12 +23,17 @@
 //         syncmers (plus the row of position 0), and is stored run-length.
 //   pbwt  the BWT of the parse (EFRank, no C array).
 //
-// Blocks (the third level).  succ(x) is the smallest phrase that follows x in
-// the parse.  Phrase i is a continuation if it equals succ of phrase i-1.  A
-// block is a phrase that is not a continuation, followed by its j >= 0
-// continuations; its symbol is (d, j), ordered by d ascending and j
-// descending, so the suffixes starting at blocks are in the same order in the
-// block sequence as in the parse.
+// Blocks (the third level).  succ(x) is the continuation of phrase x: by default
+// the smallest phrase that follows x in the parse, or (built with --continuation
+// frequent) the most frequent one.  Phrase i is a continuation if it equals succ
+// of phrase i-1.  A block is a phrase d that is not a continuation, followed by
+// its j >= 0 continuations; its symbol is (d, j, side), where side says whether
+// the first phrase of the next block is larger (+) or smaller (-) than succ of
+// the block's last phrase.  Symbols are ordered by d, then all - before all +,
+// the -'s by j ascending and the +'s by j descending, so the suffixes starting
+// at blocks are in the same order in the block sequence as in the parse.  With
+// the smallest successor every side is + (the next block's first phrase is
+// larger than succ), and the sides are not stored.
 //
 //   BS    marks the parse rows that start blocks (and row 0);
 //   bbwt  the BWT of the block sequence, over the rows BS marks.
@@ -295,38 +300,51 @@ struct Level {
     EFRank bbwt;
     PackedInts succp;               // succ(x), x = 0..sigma (0: none)
     EliasFano dstart;               // sigma + 2 values: symbols of d are dstart[d] .. dstart[d+1]-1 (0-based)
-    PackedInts jv;                  // j of each symbol, descending within each d
+    PackedInts jv;                  // j of each symbol, in symbol order within each d
+    uint8_t sided = 0;              // 1: symbols have sides (stored in sidev); 0: all +
+    std::vector<uint64_t> sidev;    // bit k: symbol k + 1 has side +
     std::vector<uint64_t> ccont;    // bit x: phrase x is a continuation somewhere in the parse
     PhraseDict dict;                // only in the level of T (shared by both directions)
 
     inline uint32_t succ(uint32_t x) const { return (uint32_t)succp.get(x); }
     inline bool can_continue(uint32_t x) const { return (ccont[x >> 6] >> (x & 63)) & 1; }
-    inline uint32_t sym(uint32_t d, uint64_t j) const {
+    inline bool sym_plus(uint64_t k) const { return !sided || ((sidev[k >> 6] >> (k & 63)) & 1); }
+    // the order of (j, side) within a d: - by j ascending, then + by j descending
+    static inline uint64_t sym_key(uint64_t j, bool plus) { return plus ? (1ull << 32) | (0xffffffffull - j) : j; }
+    // the symbol (d, j, side) (1-based), or 0 if it does not occur
+    inline uint32_t sym(uint32_t d, uint64_t j, bool plus) const {
+        if (!sided && !plus) return 0;
         uint64_t a0, b0;
         dstart.access2(d, a0, b0);
+        const uint64_t want = sym_key(j, plus);
         uint64_t a = a0, b = b0;
-        while (a < b) {                                 // jv descending
+        while (a < b) {
             uint64_t mid = (a + b) >> 1;
-            if (jv.get(mid) > j) a = mid + 1; else b = mid;
+            if (sym_key(jv.get(mid), sym_plus(mid)) < want) a = mid + 1; else b = mid;
         }
-        return (a < b0 && jv.get(a) == j) ? (uint32_t)a + 1 : 0;
+        return (a < b0 && sym_key(jv.get(a), sym_plus(a)) == want) ? (uint32_t)a + 1 : 0;
     }
     // From plain arrays, at build time.
     void set_succ(const std::vector<uint32_t>& s) { succp.build(std::vector<uint64_t>(s.begin(), s.end())); }
-    void set_symbols(const std::vector<uint64_t>& ds, const std::vector<uint64_t>& j) {
+    void set_symbols(const std::vector<uint64_t>& ds, const std::vector<uint64_t>& j,
+                     const std::vector<uint8_t>& plus, bool with_sides) {
         dstart.build(ds, nsym + 1); jv.build(j);
+        sided = with_sides;
+        sidev.assign(with_sides ? j.size() / 64 + 1 : 0, 0);
+        if (with_sides) for (size_t k = 0; k < j.size(); ++k) if (plus[k]) sidev[k >> 6] |= 1ull << (k & 63);
     }
     uint64_t table_bytes() const { return dict.bytes(); }
     uint64_t succ_bytes() const { return succp.bytes() + ccont.size() * 8; }
-    uint64_t sym_bytes() const { return dstart.bytes() + jv.bytes(); }
+    uint64_t sym_bytes() const { return dstart.bytes() + jv.bytes() + sidev.size() * 8; }
 
     void save(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("cannot write " + path);
-        fwrite("TWOLVL05", 1, 8, f);
+        fwrite(sided ? "TWOLVL06" : "TWOLVL05", 1, 8, f);
         fwrite(&n, 8, 1, f); fwrite(&m, 8, 1, f); fwrite(&sigma, 4, 1, f); fwrite(&nblocks, 8, 1, f); fwrite(&nsym, 8, 1, f);
         B.save(f); pbwt.save(f); BS.save(f); bbwt.save(f);
         succp.save(f); dstart.save(f); jv.save(f); EliasFano::wv(f, ccont);
+        if (sided) EliasFano::wv(f, sidev);
         dict.save(f);
         fclose(f);
     }
@@ -334,12 +352,15 @@ struct Level {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("cannot open " + path);
         char mg[8];
-        if (fread(mg, 1, 8, f) != 8 || std::memcmp(mg, "TWOLVL05", 8))
+        if (fread(mg, 1, 8, f) != 8 || (std::memcmp(mg, "TWOLVL05", 8) && std::memcmp(mg, "TWOLVL06", 8)))
             throw std::runtime_error(path + ": not a two-level file of this version (rebuild it)");
         if (fread(&n, 8, 1, f) != 1 || fread(&m, 8, 1, f) != 1 || fread(&sigma, 4, 1, f) != 1 ||
             fread(&nblocks, 8, 1, f) != 1 || fread(&nsym, 8, 1, f) != 1) throw std::runtime_error("read");
         B.load(f); pbwt.load(f); BS.load(f); bbwt.load(f);
         succp.load(f); dstart.load(f); jv.load(f); EliasFano::rv(f, ccont);
+        sided = mg[7] == '6';
+        sidev.clear();
+        if (sided) EliasFano::rv(f, sidev);
         dict.load(f);
         fclose(f);
     }
@@ -432,7 +453,9 @@ inline rs::SearchResult search2(const rs::RLBWT& rl, const Level& L, const PatIn
                 while (cur > 0 && blo < bhi) {
                     int32_t t0 = pi.bstart[cur - 1];
                     if (S[t0] < begin || !pi.pid[t0]) break;
-                    uint32_t y = L.sym(pi.pid[t0], (uint64_t)(cur - 1 - t0));
+                    // side: the phrase after the block against succ of the block's last phrase
+                    const bool plus = pi.pid[cur] > L.succ(pi.pid[cur - 1]);
+                    uint32_t y = L.sym(pi.pid[t0], (uint64_t)(cur - 1 - t0), plus);
                     if (!y) break;
                     uint64_t o1, o2;
                     L.bbwt.lf2(y, blo, bhi, o1, o2);
