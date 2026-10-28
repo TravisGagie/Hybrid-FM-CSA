@@ -1,8 +1,10 @@
 #!/bin/bash
-# Only ropebwt3 (alone, both strands, 1 thread), at the sizes in SIZES (default n32 n64),
-# after run_final.sh, which ran it only at 16 individuals.
+# The external tools at the sizes in SIZES (default n32 n64), after run_final.sh, which
+# ran them only at 16 individuals: how much of the patterns KeBaB (k = 20) keeps (its
+# scan only: at 16 individuals it kept more than 99.5% and sped nothing up), and
+# ropebwt3 alone (both strands, 1 thread), checked against our MEMs.
 #
-#   nohup bash run_ropebwt3_final.sh > ropebwt3_final.log 2>&1 &
+#   nohup bash run_extras_final.sh > extras_final.log 2>&1 &
 set -euo pipefail
 export LC_ALL=C
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -12,7 +14,8 @@ SIZES=${SIZES:-"n32 n64"}
 ROUNDS=${ROUNDS:-5}
 OUT="$HERE/final"
 stamp() { echo "[$(date '+%F %T')] $*"; }
-SUM="$OUT/summary_ropebwt3.txt"
+SUM="$OUT/summary_extras.txt"
+KMER=${KMER:-20}
 : > "$SUM"
 note() { echo "$*" | tee -a "$SUM"; }
 PIN=${PIN:-$(lscpu -p=CPU,MAXMHZ 2>/dev/null | grep -v '^#' | sort -t, -k2 -gr | head -1 | cut -d, -f1 || true)}
@@ -22,6 +25,7 @@ B="$HERE/build"
 RB_DIR="$HERE/../ropebwt3"
 [ -x "$RB_DIR/ropebwt3" ] || (cd "$RB_DIR" && make -j4 > /dev/null 2>&1)
 RB="$RB_DIR/ropebwt3"
+KB="$HERE/../kebab/kebab"
 Q="$OUT/queries.txt"
 [ -s "$Q" ] || { echo "run run_final.sh first"; exit 1; }
 collection_for() {
@@ -33,6 +37,24 @@ collection_for() {
 for SIZE in $SIZES; do
   D="$H/$SIZE"; R="$OUT/$SIZE"; COLL=$(collection_for "$D")
   note ""; note "== $SIZE"
+  # ---- KeBaB: the filters and the share of the patterns its fragments keep
+  K="$R/kebab"; mkdir -p "$K"
+  if [ -x "$KB" ]; then
+    if [ ! -s "$K/fwd.kbb" ]; then
+      stamp "$SIZE: KeBaB index (forward strand, k = $KMER)"
+      awk '{print ">s"NR; print}' "$COLL" > "$K/collection.fa"
+      "$KB" build -k "$KMER" --kmer-mode forward -t 8 -o "$K/fwd" "$K/collection.fa" > "$K/build_fwd.log" 2>&1
+      rm -f "$K/collection.fa"
+    fi
+    for L in 100 1000; do
+      t0=$(date +%s.%N)
+      taskset -c "$PIN" "$KB" scan -i "$K/fwd.kbb" -l "$L" -t 1 -o "$K/frag_fwd_L$L.fa" "$OUT/queries.fa" > /dev/null 2>&1
+      t=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN {printf "%.3f", b - a}')
+      note "KeBaB scan (fwd, L = $L): $t s; $(grep -c '>' "$K/frag_fwd_L$L.fa") fragments, $(grep -v '>' "$K/frag_fwd_L$L.fa" | tr -d '\n' | wc -c) characters kept"
+    done
+  else
+    note "KeBaB not found at $KB"
+  fi
   # ---- ropebwt3, alone and behind KeBaB
   RBD="$R/ropebwt3"; mkdir -p "$RBD"
   RBI="$HERE/results/$SIZE/ropebwt3/index.fmd"
