@@ -1,3 +1,5 @@
+> **Note.** This is the code for version 1 of [arXiv:2609.40299](https://arxiv.org/abs/2609.40299v1), *Mixing FM-indexes and CSAs*. Version 2, *More RLBWT Tricks*, is a different paper, implemented in [MEM-finding](https://github.com/TravisGagie/MEM-finding)'s [`tool/`](https://github.com/TravisGagie/MEM-finding/tree/tool/tool) (branch `tool`).
+
 # Hybrid-FM-CSA: an FM-index / CSA hybrid for repetitive texts over large alphabets
 
 This is the prototype accompanying the note *Mixing FM-indexes and CSAs: backward search over an order-1 rank
